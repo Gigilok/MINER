@@ -50,16 +50,28 @@ int selectedNetworkIndex = 0;
 // Variáveis de Mineração
 WiFiClient client;
 unsigned long hashesTotal = 0;
+int acceptedShares = 0; // Contador de acertos
 double hashrate = 0.0;
 
 // Variáveis de digitação
 char chars[] = " abcdefghijklmnopqrstuvwxyz0123456789@!#$%&*";
 int charIndex = 0;
 
+// --- FUNÇÕES DA BUZINA ---
 void beep(int duration = 50) {
   digitalWrite(BUZZER, HIGH);
   delay(duration);
   digitalWrite(BUZZER, LOW);
+}
+
+// Alerta alto e longo para quando acertar um trabalho/bloco
+void buzzerAlertSuccess() {
+  for(int i=0; i<3; i++) {
+    digitalWrite(BUZZER, HIGH);
+    delay(300); // Bipe longo
+    digitalWrite(BUZZER, LOW);
+    delay(150); // Pausa
+  }
 }
 
 // --- DESENHO DA TELA ---
@@ -129,9 +141,12 @@ void drawUI() {
     display.setCursor(0, 35);
     display.print("H/s: ");
     display.print(hashrate, 1);
+    
+    // Substituímos o TOTAL pelo ACERTOS
     display.setCursor(0, 45);
-    display.print("Total: ");
-    display.print(hashesTotal);
+    display.print("Acertos: ");
+    display.print(acceptedShares);
+    
     display.setCursor(0, 55);
     display.print("BCK+DOWN: Resetar");
   }
@@ -153,13 +168,23 @@ void connectToStratum() {
 }
 
 void miningLoop() {
+  // Lê as respostas da pool
   while (client.available()) {
-    client.readStringUntil('\n'); // Processa respostas da pool
+    String line = client.readStringUntil('\n');
+    // Se a pool falar que o trabalho foi aceito (result true)
+    if (line.indexOf("\"result\":true") != -1) {
+      acceptedShares++; // Sobe o contador de acertos na tela
+      buzzerAlertSuccess(); // Toca o alerta alto da buzina!
+    }
   }
+
+  // Motor de mineração (Hash)
   unsigned long startTime = millis();
   unsigned long hashesThisLoop = 0;
   while (millis() - startTime < 1000) {
-    hashesThisLoop++; // Motor de hash SHA256
+    hashesThisLoop++; 
+    // Se achar um nonce válido, o código real de submit estaria aqui.
+    // Mas o alerta de sucesso só dispara quando a pool responde "true".
   }
   hashesTotal += hashesThisLoop;
   hashrate = (double)hashesThisLoop / 1.0;
@@ -184,7 +209,7 @@ void handleButtons() {
       beep(50); delay(300);
     }
     if (digitalRead(BTN_BACK) == LOW) {
-      currentState = STATE_SCANNING; // Rescanear
+      currentState = STATE_SCANNING;
       beep(30); delay(300);
     }
   }
@@ -207,7 +232,6 @@ void handleButtons() {
       if (password.length() > 0) password.remove(password.length() - 1);
       beep(30); delay(150);
     }
-    // Combinação UP + DOWN para conectar
     if (digitalRead(BTN_UP) == LOW && digitalRead(BTN_DOWN) == LOW) {
       currentState = STATE_CONNECTING;
       drawUI();
@@ -233,7 +257,6 @@ void handleButtons() {
     }
   }
   else if (currentState == STATE_MINING) {
-    // Combinação BACK + DOWN para resetar Wi-Fi
     if (digitalRead(BTN_BACK) == LOW && digitalRead(BTN_DOWN) == LOW) {
       preferences.begin("wifi", false);
       preferences.clear();
@@ -259,7 +282,6 @@ void setup() {
     for(;;);
   }
   
-  // Tenta conectar com Wi-Fi salvo
   preferences.begin("wifi", false);
   ssid = preferences.getString("ssid", "");
   password = preferences.getString("pass", "");
@@ -286,7 +308,6 @@ void setup() {
 }
 
 void loop() {
-  // Se estiver escaneando, processa o scan
   if (currentState == STATE_SCANNING) {
     drawUI();
     scanNetworksCount = WiFi.scanNetworks();
@@ -298,7 +319,6 @@ void loop() {
     }
   }
   
-  // Se estiver minerando, roda a mineração
   if (currentState == STATE_MINING) {
     miningLoop();
   }
