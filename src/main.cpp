@@ -50,7 +50,7 @@ int selectedNetworkIndex = 0;
 // Variáveis de Mineração
 WiFiClient client;
 unsigned long hashesTotal = 0;
-int acceptedShares = 0; // Contador de acertos
+int acceptedShares = 0;
 double hashrate = 0.0;
 
 // Variáveis de digitação
@@ -59,15 +59,11 @@ int charIndex = 0;
 
 // --- FUNÇÕES DA BUZINA (Modo 2000Hz Alto) ---
 void buzzerInit() {
-    // Inicia em alta impedância para não interferir no boot do ESP32
     pinMode(BUZZER, INPUT);
 }
 
 void beep(int durationMs = 50) {
-    // Só configura como saída no momento do bip
     pinMode(BUZZER, OUTPUT);
-    
-    // Gera onda quadrada manual (2000Hz)
     int cycles = durationMs * 2; 
     for (int i = 0; i < cycles; i++) {
         digitalWrite(BUZZER, HIGH);
@@ -75,18 +71,26 @@ void beep(int durationMs = 50) {
         digitalWrite(BUZZER, LOW);
         delayMicroseconds(250);
     }
-    
-    // Volta para INPUT imediatamente após o bip
     pinMode(BUZZER, INPUT);
 }
 
 void buzzerAlertSuccess() {
-    // Alerta alto e longo para quando acertar um trabalho/bloco (3 bipes longos)
     beep(300);
     delay(150);
     beep(300);
     delay(150);
     beep(300);
+}
+
+// --- TELA DE INICIALIZAÇÃO (MINER) ---
+void drawSplashScreen() {
+  display.clearDisplay();
+  display.setTextSize(3); // Texto bem grande
+  display.setTextColor(WHITE);
+  display.setCursor(15, 15);
+  display.print("MINER");
+  display.display();
+  delay(2000); // Fica 2 segundos na tela
 }
 
 // --- DESENHO DA TELA ---
@@ -178,16 +182,18 @@ void connectToStratum() {
   String auth = "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" + String(BTC_WALLET) + "." + String(WORKER_NAME) + "\",\"x\"]}\n";
   client.print(auth);
   miningConnected = true;
-  beep(200);
+  beep(100);
 }
 
 void miningLoop() {
   while (client.available()) {
     String line = client.readStringUntil('\n');
-    // Se a pool falar que o trabalho foi aceito (result true)
-    if (line.indexOf("\"result\":true") != -1) {
-      acceptedShares++; // Sobe o contador de acertos na tela
-      buzzerAlertSuccess(); // Toca o alerta alto da buzina!
+    
+    // Ignora a resposta de login (id:2) que tambem tem result:true
+    // So dispara o acerto se for resposta de envio de bloco (id:4 ou superior)
+    if (line.indexOf("\"id\":2") == -1 && line.indexOf("\"result\":true") != -1) {
+      acceptedShares++;
+      buzzerAlertSuccess();
     }
   }
 
@@ -285,7 +291,7 @@ void setup() {
   pinMode(BTN_BACK, INPUT_PULLUP);
   pinMode(BAT_ADC, INPUT);
   
-  buzzerInit(); // Inicia a buzina em alta impedância
+  buzzerInit();
   
   Wire.begin(OLED_SDA, OLED_SCL);
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
@@ -293,6 +299,10 @@ void setup() {
     for(;;);
   }
   
+  // 1. Mostra a tela MINER logo ao ligar
+  drawSplashScreen();
+  
+  // 2. Tenta carregar Wi-Fi salvo
   preferences.begin("wifi", false);
   ssid = preferences.getString("ssid", "");
   password = preferences.getString("pass", "");
