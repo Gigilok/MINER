@@ -57,21 +57,36 @@ double hashrate = 0.0;
 char chars[] = " abcdefghijklmnopqrstuvwxyz0123456789@!#$%&*";
 int charIndex = 0;
 
-// --- FUNÇÕES DA BUZINA ---
-void beep(int duration = 50) {
-  digitalWrite(BUZZER, HIGH);
-  delay(duration);
-  digitalWrite(BUZZER, LOW);
+// --- FUNÇÕES DA BUZINA (Modo 2000Hz Alto) ---
+void buzzerInit() {
+    // Inicia em alta impedância para não interferir no boot do ESP32
+    pinMode(BUZZER, INPUT);
 }
 
-// Alerta alto e longo para quando acertar um trabalho/bloco
+void beep(int durationMs = 50) {
+    // Só configura como saída no momento do bip
+    pinMode(BUZZER, OUTPUT);
+    
+    // Gera onda quadrada manual (2000Hz)
+    int cycles = durationMs * 2; 
+    for (int i = 0; i < cycles; i++) {
+        digitalWrite(BUZZER, HIGH);
+        delayMicroseconds(250);
+        digitalWrite(BUZZER, LOW);
+        delayMicroseconds(250);
+    }
+    
+    // Volta para INPUT imediatamente após o bip
+    pinMode(BUZZER, INPUT);
+}
+
 void buzzerAlertSuccess() {
-  for(int i=0; i<3; i++) {
-    digitalWrite(BUZZER, HIGH);
-    delay(300); // Bipe longo
-    digitalWrite(BUZZER, LOW);
-    delay(150); // Pausa
-  }
+    // Alerta alto e longo para quando acertar um trabalho/bloco (3 bipes longos)
+    beep(300);
+    delay(150);
+    beep(300);
+    delay(150);
+    beep(300);
 }
 
 // --- DESENHO DA TELA ---
@@ -142,7 +157,6 @@ void drawUI() {
     display.print("H/s: ");
     display.print(hashrate, 1);
     
-    // Substituímos o TOTAL pelo ACERTOS
     display.setCursor(0, 45);
     display.print("Acertos: ");
     display.print(acceptedShares);
@@ -168,7 +182,6 @@ void connectToStratum() {
 }
 
 void miningLoop() {
-  // Lê as respostas da pool
   while (client.available()) {
     String line = client.readStringUntil('\n');
     // Se a pool falar que o trabalho foi aceito (result true)
@@ -178,13 +191,10 @@ void miningLoop() {
     }
   }
 
-  // Motor de mineração (Hash)
   unsigned long startTime = millis();
   unsigned long hashesThisLoop = 0;
   while (millis() - startTime < 1000) {
     hashesThisLoop++; 
-    // Se achar um nonce válido, o código real de submit estaria aqui.
-    // Mas o alerta de sucesso só dispara quando a pool responde "true".
   }
   hashesTotal += hashesThisLoop;
   hashrate = (double)hashesThisLoop / 1.0;
@@ -247,11 +257,11 @@ void handleButtons() {
         preferences.end();
         connectToStratum();
         currentState = STATE_MINING;
-        beep(200);
+        beep(100);
       } else {
         currentState = STATE_INPUT_PASSWORD;
         password = "";
-        beep(1000);
+        beep(500);
       }
       delay(500);
     }
@@ -273,8 +283,9 @@ void setup() {
   pinMode(BTN_DOWN, INPUT_PULLUP);
   pinMode(BTN_SEL, INPUT_PULLUP);
   pinMode(BTN_BACK, INPUT_PULLUP);
-  pinMode(BUZZER, OUTPUT);
   pinMode(BAT_ADC, INPUT);
+  
+  buzzerInit(); // Inicia a buzina em alta impedância
   
   Wire.begin(OLED_SDA, OLED_SCL);
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
