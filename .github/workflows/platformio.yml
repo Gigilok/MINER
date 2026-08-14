@@ -9,13 +9,33 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v3
+      
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
+          
       - name: Install PlatformIO Core
-        run: pip install --upgrade platformio
+        run: |
+          pip install --upgrade platformio
+          
       - name: Build Firmware
-        run: pio run
+        run: |
+          pio run
+
+      - name: Collect Binaries
+        run: |
+          mkdir firmware_output
+          cp .pio/build/esp32dev/firmware.bin firmware_output/firmware.bin
+          cp .pio/build/esp32dev/bootloader.bin firmware_output/bootloader.bin
+          cp .pio/build/esp32dev/partitions.bin firmware_output/partitions.bin
+          cp ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin firmware_output/boot_app0.bin
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: ESP32_Miner_Firmware
+          path: firmware_output/
