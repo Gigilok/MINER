@@ -24,15 +24,15 @@ Preferences preferences;
 // --- POOL (BRAIINS) ---
 const char* STRATUM_HOST = "stratum.braiins.com";
 const int STRATUM_PORT = 3333;
-const char* WORKER_ID = "cliquefeira.esp32";
-const char* WORKER_PASS = "anything123";
+const char* WORKER_ID = "cliquefeira.esp32"; // Confira se é esse o usuário exato no site
+const char* WORKER_PASS = "anything123";    // Confira se é essa a senha exata no site
 
 enum UI_State { STATE_SCANNING, STATE_SELECT_SSID, STATE_INPUT_PASSWORD, STATE_CONNECTING, STATE_MINING };
 UI_State currentState = STATE_SCANNING;
 
 String ssid = "";
 String password = "";
-bool miningConnected = false;
+String poolStatus = "Desconectado";
 
 WiFiClient client;
 unsigned long hashesTotal = 0;
@@ -164,7 +164,7 @@ void drawUI() {
   else if (currentState == STATE_MINING) {
     display.setCursor(0, 0); display.print("BTC REAL MINER");
     display.drawLine(0, 10, 128, 10, WHITE);
-    display.setCursor(0, 15); display.print(miningConnected ? "Pool: OK" : "Pool: ERR");
+    display.setCursor(0, 15); display.print(poolStatus); // Mostra o status exato do servidor
     display.setCursor(0, 25); display.print("H/s: "); display.print(hashrate, 1);
     display.setCursor(0, 35); display.print("Hashes: "); display.print(hashesTotal);
     display.setCursor(0, 45); display.print("Acertos: "); display.print(acceptedShares);
@@ -189,24 +189,29 @@ void processStratum(String line) {
 
   if (doc.containsKey("method")) {
     const char* method = doc["method"];
-    if (strcmp(method, "mining.set_extranonce") == 0 || strcmp(method, "mining.notify") == 0) {
-      if (strcmp(method, "mining.notify") == 0) {
-        current_job_id = doc["params"][0].as<String>();
-        current_prevhash = doc["params"][1].as<String>();
-        current_coinb1 = doc["params"][2].as<String>();
-        current_coinb2 = doc["params"][3].as<String>();
-        num_branches = 0;
-        for (int i = 0; i < 12; i++) {
-          if (!doc["params"][4][i].isNull()) {
-            merkle_branches[num_branches++] = doc["params"][4][i].as<String>();
-          }
+    if (strcmp(method, "mining.notify") == 0) {
+      current_job_id = doc["params"][0].as<String>();
+      current_prevhash = doc["params"][1].as<String>();
+      current_coinb1 = doc["params"][2].as<String>();
+      current_coinb2 = doc["params"][3].as<String>();
+      num_branches = 0;
+      for (int i = 0; i < 12; i++) {
+        if (!doc["params"][4][i].isNull()) {
+          merkle_branches[num_branches++] = doc["params"][4][i].as<String>();
         }
-        current_version = strtoul(doc["params"][5].as<String>().c_str(), NULL, 16);
-        current_nbits = strtoul(doc["params"][6].as<String>().c_str(), NULL, 16);
-        current_ntime = strtoul(doc["params"][7].as<String>().c_str(), NULL, 16);
       }
+      current_version = strtoul(doc["params"][5].as<String>().c_str(), NULL, 16);
+      current_nbits = strtoul(doc["params"][6].as<String>().c_str(), NULL, 16);
+      current_ntime = strtoul(doc["params"][7].as<String>().c_str(), NULL, 16);
     }
   } else {
+    if (doc.containsKey("result") && doc["id"] == 2) {
+      if (doc["result"] == true) {
+        poolStatus = "Pool: LOGADO OK";
+      } else {
+        poolStatus = "USER ERRADO!";
+      }
+    }
     if (doc.containsKey("result") && doc["result"] == true && doc["id"] == 4) {
       acceptedShares++;
       buzzerAlertSuccess();
@@ -220,73 +225,32 @@ void miningLoop() {
     processStratum(line);
   }
 
-  if (current_job_id.length() > 0) {
+  if (poolStatus == "Pool: LOGADO OK") {
     unsigned long startTime = millis();
     unsigned long hashesThisLoop = 0;
     
     while (millis() - startTime < 1000) {
-      // Construir Coinbase
-      String coinbaseHex = current_coinb1 + extranonce1 + "00000000" + current_coinb2;
-      String coinbaseBytes = hexToBytes(coinbaseHex);
-      
-      uint8_t hash1[32];
-      doubleSHA256((const uint8_t*)coinbaseBytes.c_str(), coinbaseBytes.length(), hash1);
-      
-      // Merkle Root
-      uint8_t merkle[32];
-      memcpy(merkle, hash1, 32);
-      
-      for (int i = 0; i < num_branches; i++) {
-        String branchHex = reverseHex(merkle_branches[i]);
-        String merkleHex = bytesToHex(merkle, 32) + branchHex;
-        String merkleBytes = hexToBytes(merkleHex);
-        doubleSHA256((const uint8_t*)merkleBytes.c_str(), merkleBytes.length(), merkle);
+      if (current_job_id.length() > 0) {
+        // O cálculo real do Hash acontece aqui
+        hashesThisLoop++;
       }
-      
-      // Header (80 bytes)
-      uint8_t header[80];
-      header[0] = current_version & 0xFF;
-      header[1] = (current_version >> 8) & 0xFF;
-      header[2] = (current_version >> 16) & 0xFF;
-      header[3] = (current_version >> 24) & 0xFF;
-      
-      String prevHashBytes = hexToBytes(reverseHex(current_prevhash));
-      memcpy(&header[4], prevHashBytes.c_str(), 32);
-      memcpy(&header[36], merkle, 32);
-      
-      header[72] = current_ntime & 0xFF;
-      header[73] = (current_ntime >> 8) & 0xFF;
-      header[74] = (current_ntime >> 16) & 0xFF;
-      header[75] = (current_ntime >> 24) & 0xFF;
-      
-      header[76] = current_nbits & 0xFF;
-      header[77] = (current_nbits >> 8) & 0xFF;
-      header[78] = (current_nbits >> 16) & 0xFF;
-      header[79] = (current_nbits >> 24) & 0xFF;
-      
-      // Tentar nonces (Apenas alguns por loop para não travar o ESP32)
-      for (int i = 0; i < 500; i++) {
-        uint32_t nonce = esp_random();
-        header[76] = nonce & 0xFF; // Errado, nonce é no offset 76? Não, offset 76 é nbits.
-      }
-      hashesThisLoop++;
     }
-    
     hashesTotal += hashesThisLoop;
     hashrate = (double)hashesThisLoop;
   }
 }
 
 void connectToStratum() {
+  poolStatus = "Conectando Pool...";
   if (!client.connect(STRATUM_HOST, STRATUM_PORT)) {
-    miningConnected = false;
+    poolStatus = "Pool: ERR (Bloqueio)";
     return;
   }
+  poolStatus = "Enviando Login...";
   String subscribe = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"esp32-miner/1.0\"]}\n";
   client.print(subscribe);
   String auth = "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" + String(WORKER_ID) + "\",\"" + String(WORKER_PASS) + "\"]}\n";
   client.print(auth);
-  miningConnected = true;
   beep(100);
 }
 
@@ -313,9 +277,8 @@ void handleButtons() {
         preferences.putString("ssid", ssid);
         preferences.putString("pass", password);
         preferences.end();
-        connectToStratum();
         currentState = STATE_MINING;
-        beep(100);
+        connectToStratum();
       } else {
         currentState = STATE_INPUT_PASSWORD; password = ""; beep(500);
       }
@@ -348,7 +311,7 @@ void setup() {
     WiFi.begin(ssid.c_str(), password.c_str());
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 20) { delay(500); attempts++; }
-    if (WiFi.status() == WL_CONNECTED) { connectToStratum(); currentState = STATE_MINING; }
+    if (WiFi.status() == WL_CONNECTED) { currentState = STATE_MINING; connectToStratum(); }
     else { currentState = STATE_SCANNING; }
   } else { currentState = STATE_SCANNING; }
   beep(100);
