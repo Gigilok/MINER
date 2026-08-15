@@ -39,13 +39,15 @@ unsigned long hashesTotal = 0;
 int acceptedShares = 0;
 int rejectedShares = 0;
 double hashrate = 0.0;
+unsigned long lastHashTime = 0;
+unsigned long lastBlockCheck = 0;
 
 char chars[] = " abcdefghijklmnopqrstuvwxyz0123456789@!#$%&*";
 int charIndex = 0;
 int scanNetworksCount = 0;
 int selectedNetworkIndex = 0;
 
-// --- VARIÁVEIS STRATUM (Padrão NerdMiner) ---
+// --- VARIÁVEIS STRATUM ---
 double current_difficulty = 1.0;
 String extranonce1 = "";
 int extranonce2_size = 4;
@@ -72,7 +74,7 @@ void beep(int durationMs = 50) {
 }
 void buzzerAlertSuccess() { beep(300); delay(150); beep(300); delay(150); beep(300); }
 
-// --- SHA256 E HEX (Motor NerdMiner) ---
+// --- SHA256 E HEX ---
 void doubleSHA256(const uint8_t* data, size_t len, uint8_t* out) {
     uint8_t hash1[32];
     mbedtls_sha256(data, len, hash1, 0);
@@ -98,13 +100,12 @@ void hexToBytes(const String& hex, uint8_t* bytes) {
 }
 
 bool checkHash(uint8_t* hash) {
-    // O hash do mbedtls é Big Endian. O Bitcoin compara em Little Endian.
-    // Então se os últimos bytes (31, 30, 29...) forem zero, achamos um share!
+    // Checagem de dificuldade para pools anônimas (aproximada)
     if (hash[31] > 0) return false;
     if (hash[30] > 0) return false;
     if (hash[29] > 0) return false;
     if (hash[28] > 0) return false;
-    return true; // Dificuldade aproximada de 1 (para pools anônimas)
+    return true;
 }
 
 // --- TELA ---
@@ -184,7 +185,6 @@ void processStratum(String line) {
   DeserializationError error = deserializeJson(doc, line);
   if (error) return;
 
-  // Resposta de Subscribe (id:1) -> Pegar o Extranonce1
   if (doc["id"] == 1) {
     if (doc["result"].is<JsonArray>()) {
       extranonce1 = doc["result"][1].as<String>();
@@ -192,13 +192,11 @@ void processStratum(String line) {
     }
   }
 
-  // Resposta de Authorize (id:2)
   if (doc["id"] == 2) {
     if (doc["result"] == true) poolStatus = "Pool: LOGADO OK";
     else poolStatus = "USER ERRADO!";
   }
 
-  // Resposta de Submit (id:4)
   if (doc["id"] == 4) {
     if (doc["result"] == true) {
       acceptedShares++;
@@ -208,7 +206,6 @@ void processStratum(String line) {
     }
   }
 
-  // Métodos do Servidor
   if (doc.containsKey("method")) {
     const char* method = doc["method"];
     
@@ -234,25 +231,50 @@ void processStratum(String line) {
   }
 }
 
+void connectToStratum() {
+  poolStatus = "Conectando Pool...";
+  if (!client.connect(STRATUM_HOST, STRATUM_PORT)) {
+    poolStatus = "Pool: ERR (Bloqueio)";
+    return;
+  }
+  poolStatus = "Enviando Login...";
+  String subscribe = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"esp32-miner/1.0\"]}\n";
+  client.print(subscribe);
+  String auth = "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" + String(WORKER_ID) + "\",\"" + String(WORKER_PASS) + "\"]}\n";
+  client.print(auth);
+  beep(100);
+}
+
 void miningLoop() {
+  // 1. Processa mensagens da pool sem travar o ESP32
   while (client.available()) {
     String line = client.readStringUntil('\n');
     processStratum(line);
   }
 
+  // 2. Verifica se a conexão caiu para reconectar
+  if (!client.connected()) {
+    poolStatus = "Pool: Reconectando...";
+    current_job_id = ""; // Limpa o job para parar de minerar e focar na reconexão
+    connectToStratum();
+    delay(1000); // Espera 1s antes de tentar minerar de novo para não floodar
+    return;
+  }
+
+  // 3. Se tem um Job, minera em "pequenos blocos" de tempo para o WiFi não cair
   if (poolStatus == "Pool: LOGADO OK" && current_job_id.length() > 0 && extranonce1.length() > 0) {
-    unsigned long startTime = millis();
+    
+    unsigned long loopStartTime = millis();
     unsigned long hashesThisLoop = 0;
     
-    // 1. Gera o extranonce2
     String extranonce2 = "00000000"; 
     
-    // 2. Constrói a Coinbase Transaction
+    // Constrói a Coinbase Transaction
     String coinbase_hex = current_coinb1 + extranonce1 + extranonce2 + current_coinb2;
     uint8_t coinbase_bytes[coinbase_hex.length() / 2];
     hexToBytes(coinbase_hex, coinbase_bytes);
     
-    // 3. Calcula a Merkle Root
+    // Calcula a Merkle Root
     uint8_t merkle_root[32];
     doubleSHA256(coinbase_bytes, coinbase_hex.length() / 2, merkle_root);
     
@@ -267,13 +289,11 @@ void miningLoop() {
       doubleSHA256(buf, 64, merkle_root);
     }
     
-    // 4. Constrói o Block Header de 80 bytes (Padrão NerdMiner)
+    // Constrói o Block Header de 80 bytes
     uint8_t blockheader[80];
-    
     hexToBytes(reverseHex(current_version_hex), &blockheader[0]);
     hexToBytes(reverseHex(current_prevhash), &blockheader[4]);
     
-    // Inverte a Merkle Root para Little Endian antes de colocar no header
     uint8_t rev_merkle[32];
     for(int i=0; i<32; i++) rev_merkle[i] = merkle_root[31-i];
     memcpy(&blockheader[36], rev_merkle, 32);
@@ -281,44 +301,29 @@ void miningLoop() {
     hexToBytes(reverseHex(current_ntime_hex), &blockheader[68]);
     hexToBytes(reverseHex(current_nbits_hex), &blockheader[72]);
     
-    // 5. Loop de Hashing
+    // Minera por 100 milissegundos (0.1s) e depois retorna para o FreeRTOS cuidar do WiFi
     uint32_t nonce = esp_random();
-    
-    while (millis() - startTime < 1000) {
-      // Coloca o Nonce nos últimos 4 bytes
+    while (millis() - loopStartTime < 100) {
       memcpy(&blockheader[76], &nonce, 4);
-      
-      // Calcula o Hash
       uint8_t hash[32];
       doubleSHA256(blockheader, 80, hash);
       
       hashesThisLoop++;
       
-      // Checa se o hash tem os zeros necessários
       if (checkHash(hash)) {
         submitShare(nonce, extranonce2);
       }
-      
       nonce++;
     }
     
     hashesTotal += hashesThisLoop;
-    hashrate = (double)hashesThisLoop;
+    
+    // Calcula hashrate a cada 1 segundo
+    if (millis() - lastHashTime > 1000) {
+      hashrate = hashesThisLoop * 10; // Multiplica por 10 pois rodou por 0.1s
+      lastHashTime = millis();
+    }
   }
-}
-
-void connectToStratum() {
-  poolStatus = "Conectando Pool...";
-  if (!client.connect(STRATUM_HOST, STRATUM_PORT)) {
-    poolStatus = "Pool: ERR (Bloqueio)";
-    return;
-  }
-  poolStatus = "Enviando Login...";
-  String subscribe = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"esp32-miner/1.0\"]}\n";
-  client.print(subscribe);
-  String auth = "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" + String(WORKER_ID) + "\",\"" + String(WORKER_PASS) + "\"]}\n";
-  client.print(auth);
-  beep(100);
 }
 
 // --- BOTÕES ---
