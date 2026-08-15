@@ -22,11 +22,14 @@
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 Preferences preferences;
 
-// --- POOL (BRAIINS) ---
-const char* STRATUM_HOST = "stratum.braiins.com";
+// --- POOL (public-pool.io - suporta dificuldade baixa para ESP32) ---
+// IMPORTANTE: Troque o WORKER_ID abaixo pelo seu endereço de carteira Bitcoin (BC1q... ou 1A1z...)
+// Sem uma carteira BTC real, os shares minerados não vão para lugar nenhum.
+// Crie uma carteira em: blockchain.com, wallet.com, ou use a Trust Wallet.
+const char* STRATUM_HOST = "public-pool.io";
 const int STRATUM_PORT = 3333;
-const char* WORKER_ID = "cliquefeira.esp32";
-const char* WORKER_PASS = "anything123";
+const char* WORKER_ID = "1FRpCfmiwAGVkCLt2FjVuuoAjhSaE2j4QN.esp32";  // sua carteira BTC + nome do worker
+const char* WORKER_PASS = "x";
 const double DEFAULT_DIFFICULTY = 0.00015;
 const unsigned long KEEPALIVE_MS = 30000;
 
@@ -535,7 +538,8 @@ void miningLoop() {
     }
 
     // 4. Só minera se está logado e tem job
-    if (!isAuthorized || current_job_id.length() == 0 || extranonce1.length() == 0) {
+    // NOTA: extranonce1 pode ser vazio (""), isso é valido em algumas pools
+    if (!isAuthorized || current_job_id.length() == 0 || !isSubscribed) {
         return;
     }
 
