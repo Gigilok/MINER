@@ -24,7 +24,9 @@ Preferences preferences;
 // --- POOL (public-pool.io) ---
 const char* STRATUM_HOST = "public-pool.io";
 const int STRATUM_PORT = 3333;
-const char* WORKER_ID = "1FRpCfmiwAGVkCLt2FjVuuoAjhSaE2j4QN.esp32";
+// Apenas o endereço BTC - igual ao NerdMiner_v2
+// O sufixo .esp32 impedia o painel de reconhecer o worker
+const char* WORKER_ID = "1FRpCfmiwAGVkCLt2FjVuuoAjhSaE2j4QN";
 const char* WORKER_PASS = "x";
 const double DEFAULT_DIFFICULTY = 0.00015;
 
@@ -75,6 +77,7 @@ bool isConnected = false;
 
 unsigned long extranonce2_val = 1;
 int stratumMsgId = 3;
+bool firstMiningLog = true;
 
 // JSON doc GLOBAL (não na pilha!) - mining.notify pode ter >2KB
 // NerdMiner_v2 também usa doc global por este mesmo motivo
@@ -560,6 +563,17 @@ void miningLoop() {
     uint8_t blockheader[80];
     if (!buildBlockHeader(extranonce2, blockheader)) return;
 
+    // Debug: loga primeiro header para verificação
+    if (firstMiningLog) {
+        firstMiningLog = false;
+        Serial.print("[DEBUG] Header (hex): ");
+        for (int i = 0; i < 80; i++) {
+            if (blockheader[i] < 0x10) Serial.print("0");
+            Serial.print(blockheader[i], HEX);
+        }
+        Serial.println();
+    }
+
     // 7. Minera por 50ms
     unsigned long loopStart = millis();
     uint32_t nonce = esp_random();
@@ -580,12 +594,11 @@ void miningLoop() {
         double hashDiff = diffFromTarget(hashLe);
         if (hashDiff > bestDiff) bestDiff = hashDiff;
 
-        // Conta shares locais (diff >= 0.001) para mostrar atividade
-        if (hashDiff >= 0.001) {
+        // Conta shares locais (diff >= 0.0001) para mostrar atividade
+        if (hashDiff >= 0.0001) {
             localShares++;
-            // Só loga a cada 10 shares locais para não encher o serial
-            if (localShares % 10 == 0) {
-                Serial.printf("[LOCAL] diff=%.4f nonce=%08x (total local: %lu)\n", hashDiff, nonce, localShares);
+            if (localShares <= 3 || localShares % 50 == 0) {
+                Serial.printf("[LOCAL] diff=%.6f nonce=%08x (total:%lu best:%.4f)\n", hashDiff, nonce, localShares, bestDiff);
             }
         }
 
@@ -607,11 +620,19 @@ void miningLoop() {
     hashesInWindow += localH;
 
     // 8. Hashrate (janela de 1 segundo)
-    if (now - lastHashTime >= 1000) {
-        double elapsed = (double)(now - lastHashTime) / 1000.0;
+    unsigned long now2 = millis();
+    if (now2 - lastHashTime >= 1000) {
+        double elapsed = (double)(now2 - lastHashTime) / 1000.0;
         hashrate = (double)hashesInWindow / elapsed;
         hashesInWindow = 0;
-        lastHashTime = now;
+        lastHashTime = now2;
+        // Log de hashrate a cada 5 segundos
+        static unsigned long lastHRLog = 0;
+        if (now2 - lastHRLog >= 5000) {
+            Serial.printf("[STATS] H/s=%.0f total=%luk local=%lu best=%.4f poolDiff=%.4f\n",
+                hashrate, hashesTotal/1000, localShares, bestDiff, currentPoolDifficulty);
+            lastHRLog = now2;
+        }
     }
 
     // 9. Atualiza status da tela
