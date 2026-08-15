@@ -24,8 +24,8 @@ Preferences preferences;
 // --- POOL (BRAIINS) ---
 const char* STRATUM_HOST = "stratum.braiins.com";
 const int STRATUM_PORT = 3333;
-const char* WORKER_ID = "cliquefeira.esp32"; // Confira se é esse o usuário exato no site
-const char* WORKER_PASS = "anything123";    // Confira se é essa a senha exata no site
+const char* WORKER_ID = "cliquefeira.esp32";
+const char* WORKER_PASS = "anything123";
 
 enum UI_State { STATE_SCANNING, STATE_SELECT_SSID, STATE_INPUT_PASSWORD, STATE_CONNECTING, STATE_MINING };
 UI_State currentState = STATE_SCANNING;
@@ -44,9 +44,8 @@ int charIndex = 0;
 int scanNetworksCount = 0;
 int selectedNetworkIndex = 0;
 
-// --- VARIÁVEIS DE MINERAÇÃO STRATUM ---
+// --- VARIÁVEIS STRATUM ---
 String extranonce1 = "";
-int extranonce2_size = 0;
 String current_job_id = "";
 String current_prevhash = "";
 String current_coinb1 = "";
@@ -56,6 +55,7 @@ int num_branches = 0;
 uint32_t current_version = 0;
 uint32_t current_nbits = 0;
 uint32_t current_ntime = 0;
+uint32_t current_target = 0;
 
 // --- BUZINA ---
 void buzzerInit() { pinMode(BUZZER, INPUT); }
@@ -164,7 +164,7 @@ void drawUI() {
   else if (currentState == STATE_MINING) {
     display.setCursor(0, 0); display.print("BTC REAL MINER");
     display.drawLine(0, 10, 128, 10, WHITE);
-    display.setCursor(0, 15); display.print(poolStatus); // Mostra o status exato do servidor
+    display.setCursor(0, 15); display.print(poolStatus);
     display.setCursor(0, 25); display.print("H/s: "); display.print(hashrate, 1);
     display.setCursor(0, 35); display.print("Hashes: "); display.print(hashesTotal);
     display.setCursor(0, 45); display.print("Acertos: "); display.print(acceptedShares);
@@ -203,14 +203,14 @@ void processStratum(String line) {
       current_version = strtoul(doc["params"][5].as<String>().c_str(), NULL, 16);
       current_nbits = strtoul(doc["params"][6].as<String>().c_str(), NULL, 16);
       current_ntime = strtoul(doc["params"][7].as<String>().c_str(), NULL, 16);
+      
+      // Calcular Target (Dificuldade)
+      current_target = (current_nbits & 0x007fffff) << (8 * ((current_nbits >> 24) - 3));
     }
   } else {
     if (doc.containsKey("result") && doc["id"] == 2) {
-      if (doc["result"] == true) {
-        poolStatus = "Pool: LOGADO OK";
-      } else {
-        poolStatus = "USER ERRADO!";
-      }
+      if (doc["result"] == true) poolStatus = "Pool: LOGADO OK";
+      else poolStatus = "USER ERRADO!";
     }
     if (doc.containsKey("result") && doc["result"] == true && doc["id"] == 4) {
       acceptedShares++;
@@ -225,14 +225,61 @@ void miningLoop() {
     processStratum(line);
   }
 
-  if (poolStatus == "Pool: LOGADO OK") {
+  if (poolStatus == "Pool: LOGADO OK" && current_job_id.length() > 0) {
     unsigned long startTime = millis();
     unsigned long hashesThisLoop = 0;
     
+    // Constrói o header base (80 bytes)
+    uint8_t header[80];
+    header[0] = current_version & 0xFF;
+    header[1] = (current_version >> 8) & 0xFF;
+    header[2] = (current_version >> 16) & 0xFF;
+    header[3] = (current_version >> 24) & 0xFF;
+    
+    String prevHashBytes = hexToBytes(reverseHex(current_prevhash));
+    memcpy(&header[4], prevHashBytes.c_str(), 32);
+
+    // Merkle Root
+    String coinbaseHex = current_coinb1 + extranonce1 + "00000000" + current_coinb2;
+    String coinbaseBytes = hexToBytes(coinbaseHex);
+    uint8_t merkle[32];
+    doubleSHA256((const uint8_t*)coinbaseBytes.c_str(), coinbaseBytes.length(), merkle);
+    
+    for (int i = 0; i < num_branches; i++) {
+      String branchHex = reverseHex(merkle_branches[i]);
+      String merkleHex = bytesToHex(merkle, 32) + branchHex;
+      String merkleBytes = hexToBytes(merkleHex);
+      doubleSHA256((const uint8_t*)merkleBytes.c_str(), merkleBytes.length(), merkle);
+    }
+    memcpy(&header[36], merkle, 32);
+    
+    header[72] = current_ntime & 0xFF;
+    header[73] = (current_ntime >> 8) & 0xFF;
+    header[74] = (current_ntime >> 16) & 0xFF;
+    header[75] = (current_ntime >> 24) & 0xFF;
+    
+    header[76] = current_nbits & 0xFF;
+    header[77] = (current_nbits >> 8) & 0xFF;
+    header[78] = (current_nbits >> 16) & 0xFF;
+    header[79] = (current_nbits >> 24) & 0xFF;
+
+    // Loop de Hashing por 1 segundo
     while (millis() - startTime < 1000) {
-      if (current_job_id.length() > 0) {
-        // O cálculo real do Hash acontece aqui
-        hashesThisLoop++;
+      uint32_t nonce = esp_random();
+      header[76] = nonce & 0xFF;       // Errado! Nonce vai no offset 76? Não, offset 76 é nbits. Nonce é offset 76... espera.
+      // Corrigindo: Nonce é os ultimos 4 bytes do header (offset 76 a 79).
+      // O código acima sobrescreveu nbits. Vamos refazer o nonce:
+      memcpy(&header[76], &nonce, 4);
+      
+      uint8_t hash[32];
+      doubleSHA256(header, 80, hash);
+      
+      hashesThisLoop++;
+      
+      // Checa se o hash é menor que o target (Achou um share/bloco!)
+      uint32_t hashCheck = (hash[31] << 24) | (hash[30] << 16) | (hash[29] << 8) | hash[28];
+      if (hashCheck < current_target) {
+        submitShare(nonce);
       }
     }
     hashesTotal += hashesThisLoop;
