@@ -37,6 +37,7 @@ String poolStatus = "Desconectado";
 WiFiClient client;
 unsigned long hashesTotal = 0;
 int acceptedShares = 0;
+int rejectedShares = 0;
 double hashrate = 0.0;
 
 char chars[] = " abcdefghijklmnopqrstuvwxyz0123456789@!#$%&*";
@@ -44,7 +45,7 @@ int charIndex = 0;
 int scanNetworksCount = 0;
 int selectedNetworkIndex = 0;
 
-// --- VARIÁVEIS STRATUM ---
+// --- VARIÁVEIS STRATUM (Padrão NerdMiner) ---
 double current_difficulty = 1.0;
 String extranonce1 = "";
 int extranonce2_size = 4;
@@ -71,7 +72,7 @@ void beep(int durationMs = 50) {
 }
 void buzzerAlertSuccess() { beep(300); delay(150); beep(300); delay(150); beep(300); }
 
-// --- SHA256 (Motor do NerdMiner) ---
+// --- SHA256 E HEX (Motor NerdMiner) ---
 void doubleSHA256(const uint8_t* data, size_t len, uint8_t* out) {
     uint8_t hash1[32];
     mbedtls_sha256(data, len, hash1, 0);
@@ -88,32 +89,22 @@ String reverseHex(String hex) {
 
 void hexToBytes(const String& hex, uint8_t* bytes) {
     for (int i = 0; i < hex.length() / 2; i++) {
-        char c = hex.charAt(i * 2);
-        int high = (c >= 'a') ? (c - 'a' + 10) : (c - '0');
-        c = hex.charAt(i * 2 + 1);
-        int low = (c >= 'a') ? (c - 'a' + 10) : (c - '0');
+        char c1 = hex.charAt(i * 2);
+        char c2 = hex.charAt(i * 2 + 1);
+        int high = (c1 >= 'a') ? (c1 - 'a' + 10) : (c1 - '0');
+        int low = (c2 >= 'a') ? (c2 - 'a' + 10) : (c2 - '0');
         bytes[i] = (high << 4) | low;
     }
 }
 
-// Checagem de Dificuldade (Se o hash é menor que o target)
-bool checkHash(uint8_t* hash, double difficulty) {
-    if (difficulty <= 0) difficulty = 1.0;
-    // Target máximo do Bitcoin: 0x00000000FFFF0000... (em Little Endian)
-    if (hash[31] > 0 || hash[30] > 0 || hash[29] > 0 || hash[28] > 0) return false;
-    
-    double max_val = 0xFFFF;
-    double target_val = max_val / difficulty;
-    uint32_t target_int = (uint32_t)target_val;
-    
-    uint32_t hash_val = ((uint32_t)hash[27] << 8) | hash[26];
-    if (hash_val < target_int) return true;
-    if (hash_val > target_int) return false;
-    
-    for (int i = 25; i >= 0; i--) {
-        if (hash[i] > 0) return false;
-    }
-    return true;
+bool checkHash(uint8_t* hash) {
+    // O hash do mbedtls é Big Endian. O Bitcoin compara em Little Endian.
+    // Então se os últimos bytes (31, 30, 29...) forem zero, achamos um share!
+    if (hash[31] > 0) return false;
+    if (hash[30] > 0) return false;
+    if (hash[29] > 0) return false;
+    if (hash[28] > 0) return false;
+    return true; // Dificuldade aproximada de 1 (para pools anônimas)
 }
 
 // --- TELA ---
@@ -172,7 +163,8 @@ void drawUI() {
     display.setCursor(0, 15); display.print(poolStatus);
     display.setCursor(0, 25); display.print("H/s: "); display.print(hashrate, 1);
     display.setCursor(0, 35); display.print("Hashes: "); display.print(hashesTotal);
-    display.setCursor(0, 45); display.print("Acertos: "); display.print(acceptedShares);
+    display.setCursor(0, 45); display.print("Ok: "); display.print(acceptedShares);
+    display.print(" Rej: "); display.print(rejectedShares);
     display.setCursor(0, 55); display.print("BCK+DOWN: Resetar");
   }
   display.display();
@@ -192,6 +184,31 @@ void processStratum(String line) {
   DeserializationError error = deserializeJson(doc, line);
   if (error) return;
 
+  // Resposta de Subscribe (id:1) -> Pegar o Extranonce1
+  if (doc["id"] == 1) {
+    if (doc["result"].is<JsonArray>()) {
+      extranonce1 = doc["result"][1].as<String>();
+      extranonce2_size = doc["result"][2].as<int>();
+    }
+  }
+
+  // Resposta de Authorize (id:2)
+  if (doc["id"] == 2) {
+    if (doc["result"] == true) poolStatus = "Pool: LOGADO OK";
+    else poolStatus = "USER ERRADO!";
+  }
+
+  // Resposta de Submit (id:4)
+  if (doc["id"] == 4) {
+    if (doc["result"] == true) {
+      acceptedShares++;
+      buzzerAlertSuccess();
+    } else {
+      rejectedShares++;
+    }
+  }
+
+  // Métodos do Servidor
   if (doc.containsKey("method")) {
     const char* method = doc["method"];
     
@@ -214,15 +231,6 @@ void processStratum(String line) {
       current_nbits_hex = doc["params"][6].as<String>();
       current_ntime_hex = doc["params"][7].as<String>();
     }
-  } else {
-    if (doc.containsKey("result") && doc["id"] == 2) {
-      if (doc["result"] == true) poolStatus = "Pool: LOGADO OK";
-      else poolStatus = "USER ERRADO!";
-    }
-    if (doc.containsKey("result") && doc["result"] == true && doc["id"] == 4) {
-      acceptedShares++;
-      buzzerAlertSuccess();
-    }
   }
 }
 
@@ -232,15 +240,12 @@ void miningLoop() {
     processStratum(line);
   }
 
-  if (poolStatus == "Pool: LOGADO OK" && current_job_id.length() > 0) {
+  if (poolStatus == "Pool: LOGADO OK" && current_job_id.length() > 0 && extranonce1.length() > 0) {
     unsigned long startTime = millis();
     unsigned long hashesThisLoop = 0;
     
-    // 1. Gera o extranonce2 aleatório para este job
-    uint32_t ex2_rand = esp_random();
-    char ex2_buf[9];
-    sprintf(ex2_buf, "%08x", ex2_rand);
-    String extranonce2 = String(ex2_buf);
+    // 1. Gera o extranonce2
+    String extranonce2 = "00000000"; 
     
     // 2. Constrói a Coinbase Transaction
     String coinbase_hex = current_coinb1 + extranonce1 + extranonce2 + current_coinb2;
@@ -262,43 +267,35 @@ void miningLoop() {
       doubleSHA256(buf, 64, merkle_root);
     }
     
-    // 4. Constrói o Block Header de 80 bytes
+    // 4. Constrói o Block Header de 80 bytes (Padrão NerdMiner)
     uint8_t blockheader[80];
     
-    // Version (Little Endian)
-    String rev_version = reverseHex(current_version_hex);
-    hexToBytes(rev_version, &blockheader[0]);
+    hexToBytes(reverseHex(current_version_hex), &blockheader[0]);
+    hexToBytes(reverseHex(current_prevhash), &blockheader[4]);
     
-    // PrevHash (Little Endian)
-    String rev_prevhash = reverseHex(current_prevhash);
-    hexToBytes(rev_prevhash, &blockheader[4]);
+    // Inverte a Merkle Root para Little Endian antes de colocar no header
+    uint8_t rev_merkle[32];
+    for(int i=0; i<32; i++) rev_merkle[i] = merkle_root[31-i];
+    memcpy(&blockheader[36], rev_merkle, 32);
     
-    // Merkle Root (Já está em Little Endano)
-    memcpy(&blockheader[36], merkle_root, 32);
+    hexToBytes(reverseHex(current_ntime_hex), &blockheader[68]);
+    hexToBytes(reverseHex(current_nbits_hex), &blockheader[72]);
     
-    // nTime (Little Endian)
-    String rev_ntime = reverseHex(current_ntime_hex);
-    hexToBytes(rev_ntime, &blockheader[68]);
-    
-    // nBits (Little Endian)
-    String rev_nbits = reverseHex(current_nbits_hex);
-    hexToBytes(rev_nbits, &blockheader[72]);
-    
-    // 5. Loop de Hashing (Mineração real por 1 segundo)
+    // 5. Loop de Hashing
     uint32_t nonce = esp_random();
     
     while (millis() - startTime < 1000) {
-      // Coloca o Nonce nos últimos 4 bytes do header (offset 76)
+      // Coloca o Nonce nos últimos 4 bytes
       memcpy(&blockheader[76], &nonce, 4);
       
-      // Faz o duplo SHA256
+      // Calcula o Hash
       uint8_t hash[32];
       doubleSHA256(blockheader, 80, hash);
       
       hashesThisLoop++;
       
-      // Checa se achou um Share ou Bloco!
-      if (checkHash(hash, current_difficulty)) {
+      // Checa se o hash tem os zeros necessários
+      if (checkHash(hash)) {
         submitShare(nonce, extranonce2);
       }
       
