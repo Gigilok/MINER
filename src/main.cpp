@@ -378,8 +378,11 @@ void submitShare(uint32_t nonce, const String& extranonce2) {
 }
 
 void suggestDifficulty(double diff) {
-    String payload = "{\"id\":null,\"method\":\"mining.suggest_difficulty\",\"params\":[" + String(diff, 6) + "]}\n";
-    client.print(payload);
+    // Usa ID inteiro válido (a pool pode ignorar mensagens com id=null)
+    // Usa formato %.10g igual ao NerdMiner_v2
+    char buf[128];
+    snprintf(buf, sizeof(buf), "{\"id\":%d,\"method\":\"mining.suggest_difficulty\",\"params\":[%.10g]}\n", stratumMsgId++, diff);
+    client.print(buf);
 }
 
 void processStratum(String line) {
@@ -440,8 +443,15 @@ void processStratum(String line) {
         const char* method = doc["method"];
 
         if (strcmp(method, "mining.set_difficulty") == 0) {
-            currentPoolDifficulty = doc["params"][0].as<double>();
-            Serial.printf("[STRATUM] Pool difficulty: %f\n", currentPoolDifficulty);
+            double newDiff = doc["params"][0].as<double>();
+            Serial.printf("[STRATUM] Pool difficulty: %f\n", newDiff);
+            // Se a pool mandou dificuldade muito alta, reenvia suggest imediatamente
+            if (newDiff > 1.0) {
+                Serial.printf("[STRATUM] Diff too high, re-suggesting %.10g\n", DEFAULT_DIFFICULTY);
+                suggestDifficulty(DEFAULT_DIFFICULTY);
+            } else {
+                currentPoolDifficulty = newDiff;
+            }
         }
 
         if (strcmp(method, "mining.notify") == 0) {
@@ -490,8 +500,8 @@ void connectToStratum() {
     Serial.printf("[STRATUM] Connected to %s:%d\n", STRATUM_HOST, STRATUM_PORT);
     poolStatus = "Enviando Login...";
 
-    // mining.subscribe
-    String sub = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"esp32-miner/1.0.0\"]}\n";
+    // mining.subscribe (user agent igual ao NerdMiner_v2 para a pool reconhecer)
+    String sub = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"NerdMinerV2/V1.8.3\"]}\n";
     client.print(sub);
 
     // mining.authorize
