@@ -45,17 +45,18 @@ int scanNetworksCount = 0;
 int selectedNetworkIndex = 0;
 
 // --- VARIÁVEIS STRATUM ---
+double current_difficulty = 1.0;
 String extranonce1 = "";
+int extranonce2_size = 4;
 String current_job_id = "";
 String current_prevhash = "";
 String current_coinb1 = "";
 String current_coinb2 = "";
 String merkle_branches[12];
 int num_branches = 0;
-uint32_t current_version = 0;
-uint32_t current_nbits = 0;
-uint32_t current_ntime = 0;
-uint32_t current_target = 0;
+String current_version_hex = "";
+String current_nbits_hex = "";
+String current_ntime_hex = "";
 
 // --- BUZINA ---
 void buzzerInit() { pinMode(BUZZER, INPUT); }
@@ -70,37 +71,11 @@ void beep(int durationMs = 50) {
 }
 void buzzerAlertSuccess() { beep(300); delay(150); beep(300); delay(150); beep(300); }
 
-// --- SHA256 ---
-void doubleSHA256(const uint8_t* data, size_t len, uint8_t* hash) {
+// --- SHA256 (Motor do NerdMiner) ---
+void doubleSHA256(const uint8_t* data, size_t len, uint8_t* out) {
     uint8_t hash1[32];
-    mbedtls_sha256_context ctx;
-    mbedtls_sha256_init(&ctx);
-    mbedtls_sha256_starts(&ctx, 0);
-    mbedtls_sha256_update(&ctx, data, len);
-    mbedtls_sha256_finish(&ctx, hash1);
-    mbedtls_sha256_starts(&ctx, 0);
-    mbedtls_sha256_update(&ctx, hash1, 32);
-    mbedtls_sha256_finish(&ctx, hash);
-    mbedtls_sha256_free(&ctx);
-}
-
-String hexToBytes(String hex) {
-  String bytes = "";
-  for (int i = 0; i < hex.length(); i += 2) {
-    char c = (char)strtol(hex.substring(i, i+2).c_str(), NULL, 16);
-    bytes += c;
-  }
-  return bytes;
-}
-
-String bytesToHex(const uint8_t* bytes, size_t len) {
-  String hex = "";
-  for (size_t i = 0; i < len; i++) {
-    char buf[3];
-    sprintf(buf, "%02x", bytes[i]);
-    hex += buf;
-  }
-  return hex;
+    mbedtls_sha256(data, len, hash1, 0);
+    mbedtls_sha256(hash1, 32, out, 0);
 }
 
 String reverseHex(String hex) {
@@ -109,6 +84,36 @@ String reverseHex(String hex) {
     reversed += hex.substring(i, i+2);
   }
   return reversed;
+}
+
+void hexToBytes(const String& hex, uint8_t* bytes) {
+    for (int i = 0; i < hex.length() / 2; i++) {
+        char c = hex.charAt(i * 2);
+        int high = (c >= 'a') ? (c - 'a' + 10) : (c - '0');
+        c = hex.charAt(i * 2 + 1);
+        int low = (c >= 'a') ? (c - 'a' + 10) : (c - '0');
+        bytes[i] = (high << 4) | low;
+    }
+}
+
+// Checagem de Dificuldade (Se o hash é menor que o target)
+bool checkHash(uint8_t* hash, double difficulty) {
+    if (difficulty <= 0) difficulty = 1.0;
+    // Target máximo do Bitcoin: 0x00000000FFFF0000... (em Little Endian)
+    if (hash[31] > 0 || hash[30] > 0 || hash[29] > 0 || hash[28] > 0) return false;
+    
+    double max_val = 0xFFFF;
+    double target_val = max_val / difficulty;
+    uint32_t target_int = (uint32_t)target_val;
+    
+    uint32_t hash_val = ((uint32_t)hash[27] << 8) | hash[26];
+    if (hash_val < target_int) return true;
+    if (hash_val > target_int) return false;
+    
+    for (int i = 25; i >= 0; i--) {
+        if (hash[i] > 0) return false;
+    }
+    return true;
 }
 
 // --- TELA ---
@@ -174,11 +179,11 @@ void drawUI() {
 }
 
 // --- STRATUM ---
-void submitShare(uint32_t nonce) {
-  String nonceHex = String(nonce, 16);
+void submitShare(uint32_t nonce, String extranonce2) {
+  String nonceHex = String(nonce, HEX);
   while(nonceHex.length() < 8) nonceHex = "0" + nonceHex;
   
-  String payload = "{\"id\":4,\"method\":\"mining.submit\",\"params\":[\"" + String(WORKER_ID) + "\",\"" + current_job_id + "\",\"" + extranonce1 + nonceHex + "\",\"" + String(current_ntime, 16) + "\",\"" + nonceHex + "\"]}\n";
+  String payload = "{\"id\":4,\"method\":\"mining.submit\",\"params\":[\"" + String(WORKER_ID) + "\",\"" + current_job_id + "\",\"" + extranonce2 + "\",\"" + current_ntime_hex + "\",\"" + nonceHex + "\"]}\n";
   client.print(payload);
 }
 
@@ -189,6 +194,11 @@ void processStratum(String line) {
 
   if (doc.containsKey("method")) {
     const char* method = doc["method"];
+    
+    if (strcmp(method, "mining.set_difficulty") == 0) {
+      current_difficulty = doc["params"][0].as<double>();
+    }
+    
     if (strcmp(method, "mining.notify") == 0) {
       current_job_id = doc["params"][0].as<String>();
       current_prevhash = doc["params"][1].as<String>();
@@ -200,12 +210,9 @@ void processStratum(String line) {
           merkle_branches[num_branches++] = doc["params"][4][i].as<String>();
         }
       }
-      current_version = strtoul(doc["params"][5].as<String>().c_str(), NULL, 16);
-      current_nbits = strtoul(doc["params"][6].as<String>().c_str(), NULL, 16);
-      current_ntime = strtoul(doc["params"][7].as<String>().c_str(), NULL, 16);
-      
-      // Calcular Target (Dificuldade)
-      current_target = (current_nbits & 0x007fffff) << (8 * ((current_nbits >> 24) - 3));
+      current_version_hex = doc["params"][5].as<String>();
+      current_nbits_hex = doc["params"][6].as<String>();
+      current_ntime_hex = doc["params"][7].as<String>();
     }
   } else {
     if (doc.containsKey("result") && doc["id"] == 2) {
@@ -229,59 +236,75 @@ void miningLoop() {
     unsigned long startTime = millis();
     unsigned long hashesThisLoop = 0;
     
-    // Constrói o header base (80 bytes)
-    uint8_t header[80];
-    header[0] = current_version & 0xFF;
-    header[1] = (current_version >> 8) & 0xFF;
-    header[2] = (current_version >> 16) & 0xFF;
-    header[3] = (current_version >> 24) & 0xFF;
+    // 1. Gera o extranonce2 aleatório para este job
+    uint32_t ex2_rand = esp_random();
+    char ex2_buf[9];
+    sprintf(ex2_buf, "%08x", ex2_rand);
+    String extranonce2 = String(ex2_buf);
     
-    String prevHashBytes = hexToBytes(reverseHex(current_prevhash));
-    memcpy(&header[4], prevHashBytes.c_str(), 32);
-
-    // Merkle Root
-    String coinbaseHex = current_coinb1 + extranonce1 + "00000000" + current_coinb2;
-    String coinbaseBytes = hexToBytes(coinbaseHex);
-    uint8_t merkle[32];
-    doubleSHA256((const uint8_t*)coinbaseBytes.c_str(), coinbaseBytes.length(), merkle);
+    // 2. Constrói a Coinbase Transaction
+    String coinbase_hex = current_coinb1 + extranonce1 + extranonce2 + current_coinb2;
+    uint8_t coinbase_bytes[coinbase_hex.length() / 2];
+    hexToBytes(coinbase_hex, coinbase_bytes);
+    
+    // 3. Calcula a Merkle Root
+    uint8_t merkle_root[32];
+    doubleSHA256(coinbase_bytes, coinbase_hex.length() / 2, merkle_root);
     
     for (int i = 0; i < num_branches; i++) {
-      String branchHex = reverseHex(merkle_branches[i]);
-      String merkleHex = bytesToHex(merkle, 32) + branchHex;
-      String merkleBytes = hexToBytes(merkleHex);
-      doubleSHA256((const uint8_t*)merkleBytes.c_str(), merkleBytes.length(), merkle);
-    }
-    memcpy(&header[36], merkle, 32);
-    
-    header[72] = current_ntime & 0xFF;
-    header[73] = (current_ntime >> 8) & 0xFF;
-    header[74] = (current_ntime >> 16) & 0xFF;
-    header[75] = (current_ntime >> 24) & 0xFF;
-    
-    header[76] = current_nbits & 0xFF;
-    header[77] = (current_nbits >> 8) & 0xFF;
-    header[78] = (current_nbits >> 16) & 0xFF;
-    header[79] = (current_nbits >> 24) & 0xFF;
-
-    // Loop de Hashing por 1 segundo
-    while (millis() - startTime < 1000) {
-      uint32_t nonce = esp_random();
-      header[76] = nonce & 0xFF;       // Errado! Nonce vai no offset 76? Não, offset 76 é nbits. Nonce é offset 76... espera.
-      // Corrigindo: Nonce é os ultimos 4 bytes do header (offset 76 a 79).
-      // O código acima sobrescreveu nbits. Vamos refazer o nonce:
-      memcpy(&header[76], &nonce, 4);
+      String reversed_branch = reverseHex(merkle_branches[i]);
+      uint8_t branch[32];
+      hexToBytes(reversed_branch, branch);
       
+      uint8_t buf[64];
+      memcpy(buf, merkle_root, 32);
+      memcpy(buf + 32, branch, 32);
+      doubleSHA256(buf, 64, merkle_root);
+    }
+    
+    // 4. Constrói o Block Header de 80 bytes
+    uint8_t blockheader[80];
+    
+    // Version (Little Endian)
+    String rev_version = reverseHex(current_version_hex);
+    hexToBytes(rev_version, &blockheader[0]);
+    
+    // PrevHash (Little Endian)
+    String rev_prevhash = reverseHex(current_prevhash);
+    hexToBytes(rev_prevhash, &blockheader[4]);
+    
+    // Merkle Root (Já está em Little Endano)
+    memcpy(&blockheader[36], merkle_root, 32);
+    
+    // nTime (Little Endian)
+    String rev_ntime = reverseHex(current_ntime_hex);
+    hexToBytes(rev_ntime, &blockheader[68]);
+    
+    // nBits (Little Endian)
+    String rev_nbits = reverseHex(current_nbits_hex);
+    hexToBytes(rev_nbits, &blockheader[72]);
+    
+    // 5. Loop de Hashing (Mineração real por 1 segundo)
+    uint32_t nonce = esp_random();
+    
+    while (millis() - startTime < 1000) {
+      // Coloca o Nonce nos últimos 4 bytes do header (offset 76)
+      memcpy(&blockheader[76], &nonce, 4);
+      
+      // Faz o duplo SHA256
       uint8_t hash[32];
-      doubleSHA256(header, 80, hash);
+      doubleSHA256(blockheader, 80, hash);
       
       hashesThisLoop++;
       
-      // Checa se o hash é menor que o target (Achou um share/bloco!)
-      uint32_t hashCheck = (hash[31] << 24) | (hash[30] << 16) | (hash[29] << 8) | hash[28];
-      if (hashCheck < current_target) {
-        submitShare(nonce);
+      // Checa se achou um Share ou Bloco!
+      if (checkHash(hash, current_difficulty)) {
+        submitShare(nonce, extranonce2);
       }
+      
+      nonce++;
     }
+    
     hashesTotal += hashesThisLoop;
     hashrate = (double)hashesThisLoop;
   }
