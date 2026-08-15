@@ -76,6 +76,10 @@ bool isConnected = false;
 unsigned long extranonce2_val = 1;
 int stratumMsgId = 3;
 
+// JSON doc GLOBAL (não na pilha!) - mining.notify pode ter >2KB
+// NerdMiner_v2 também usa doc global por este mesmo motivo
+StaticJsonDocument<JSON_DOC_SIZE> g_doc;
+
 // Timers
 unsigned long lastSuggestTime = 0;
 unsigned long lastJobTime = 0;
@@ -327,8 +331,9 @@ void suggestDifficulty(double diff) {
 void processStratum(String line) {
     if (line.length() < 2) return;
 
-    StaticJsonDocument<JSON_DOC_SIZE> doc;
-    DeserializationError error = deserializeJson(doc, line);
+    // Usa doc global para evitar stack overflow
+    g_doc.clear();
+    DeserializationError error = deserializeJson(g_doc, line);
     if (error) {
         Serial.printf("[JSON ERRO] len=%d err=%s\n", line.length(), error.c_str());
         return;
@@ -337,13 +342,12 @@ void processStratum(String line) {
     lastPoolDataTime = millis();
 
     // --- Resposta ao mining.subscribe (id=1) ---
-    if (doc.containsKey("id")) {
-        int id = doc["id"].as<int>();
+    if (g_doc.containsKey("id")) {
+        int id = g_doc["id"].as<int>();
 
         if (id == 1 && !isSubscribed) {
-            // Resposta do subscribe
-            if (doc["result"].is<JsonArray>()) {
-                JsonArray arr = doc["result"].as<JsonArray>();
+            if (g_doc["result"].is<JsonArray>()) {
+                JsonArray arr = g_doc["result"].as<JsonArray>();
                 extranonce1 = arr[1].as<String>();
                 extranonce2_size = arr[2].as<int>();
                 if (extranonce2_size <= 0) extranonce2_size = 4;
@@ -354,59 +358,58 @@ void processStratum(String line) {
         }
         // Resposta ao mining.authorize (id=2)
         else if (id == 2 && !isAuthorized) {
-            if (doc["result"] == true) {
+            if (g_doc["result"] == true) {
                 isAuthorized = true;
                 poolStatus = "Logado! Minerando...";
                 Serial.println("[STRATUM] Authorized OK!");
-            } else if (doc.containsKey("error") && !doc["error"].isNull()) {
+            } else if (g_doc.containsKey("error") && !g_doc["error"].isNull()) {
                 poolStatus = "ERRO: Login!";
                 Serial.print("[STRATUM] Auth FAILED: ");
-                serializeJson(doc["error"], Serial);
+                serializeJson(g_doc["error"], Serial);
                 Serial.println();
             }
         }
         // Respostas ao mining.submit (id >= 3)
         else if (id >= 3) {
-            if (doc["result"] == true) {
+            if (g_doc["result"] == true) {
                 acceptedShares++;
                 Serial.println("[SHARE] *** ACCEPTED! ***");
                 buzzerAlertSuccess();
             } else {
                 rejectedShares++;
                 Serial.print("[SHARE] REJECTED: ");
-                if (doc.containsKey("error")) serializeJson(doc["error"], Serial);
+                if (g_doc.containsKey("error")) serializeJson(g_doc["error"], Serial);
                 Serial.println();
             }
         }
     }
 
     // --- Notificações do pool (method) ---
-    if (doc.containsKey("method")) {
-        const char* method = doc["method"];
+    if (g_doc.containsKey("method")) {
+        const char* method = g_doc["method"];
 
         if (strcmp(method, "mining.set_difficulty") == 0) {
-            double newDiff = doc["params"][0].as<double>();
+            double newDiff = g_doc["params"][0].as<double>();
             currentPoolDifficulty = newDiff;
             Serial.printf("[STRATUM] Pool set diff: %.6f\n", newDiff);
         }
 
         if (strcmp(method, "mining.notify") == 0) {
-            String newJobId = doc["params"][0].as<String>();
-            current_prevhash = doc["params"][1].as<String>();
-            current_coinb1 = doc["params"][2].as<String>();
-            current_coinb2 = doc["params"][3].as<String>();
+            String newJobId = g_doc["params"][0].as<String>();
+            current_prevhash = g_doc["params"][1].as<String>();
+            current_coinb1 = g_doc["params"][2].as<String>();
+            current_coinb2 = g_doc["params"][3].as<String>();
 
-            // Merkle branches
             num_branches = 0;
-            JsonArray branches = doc["params"][4];
+            JsonArray branches = g_doc["params"][4];
             for (int i = 0; i < 16 && i < branches.size(); i++) {
                 if (!branches[i].isNull())
                     merkle_branches[num_branches++] = branches[i].as<String>();
             }
 
-            current_version_hex = doc["params"][5].as<String>();
-            current_nbits_hex = doc["params"][6].as<String>();
-            current_ntime_hex = doc["params"][7].as<String>();
+            current_version_hex = g_doc["params"][5].as<String>();
+            current_nbits_hex = g_doc["params"][6].as<String>();
+            current_ntime_hex = g_doc["params"][7].as<String>();
 
             current_job_id = newJobId;
             extranonce2_val = 1;
