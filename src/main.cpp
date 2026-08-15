@@ -500,14 +500,15 @@ void connectToStratum() {
 // ============================================================
 
 void miningLoop() {
-    unsigned long now = millis();
-
     // 1. Processa TODAS mensagens pendentes da pool
     while (client.available()) {
         String line = client.readStringUntil('\n');
         line.trim();
         if (line.length() > 0) processStratum(line);
     }
+
+    // Recaptura tempo APÓS processar mensagens (processStratum atualiza lastPoolDataTime)
+    unsigned long now = millis();
 
     // 2. Verifica conexão
     if (!client.connected()) {
