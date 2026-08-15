@@ -86,8 +86,27 @@ bool isAuthorized = false;
 bool isConnected = false;
 
 unsigned long extranonce2_val = 1;
-int stratumMsgId = 3;
+int stratumMsgId = 4;  // Próximo ID disponível (1=subscribe, 2=auth, 3=suggest)
 bool firstMiningLog = true;
+
+// Controle de IDs de submit para não confundir com keepalive
+#define MAX_SUBMIT_IDS 16
+unsigned long submitIdList[MAX_SUBMIT_IDS];
+int submitIdCount = 0;
+unsigned long sharesSubmitted = 0;  // Total de shares enviados (não confundir com Ok/Rj)
+
+void trackSubmitId(unsigned long id) {
+    submitIdList[submitIdCount % MAX_SUBMIT_IDS] = id;
+    submitIdCount++;
+}
+
+bool isRealSubmitId(unsigned long id) {
+    int check = submitIdCount < MAX_SUBMIT_IDS ? submitIdCount : MAX_SUBMIT_IDS;
+    for (int i = 0; i < check; i++) {
+        if (submitIdList[i] == id) return true;
+    }
+    return false;
+}
 
 // JSON doc GLOBAL (não na pilha!) - mining.notify pode ter >2KB
 // NerdMiner_v2 também usa doc global por este mesmo motivo
@@ -289,7 +308,7 @@ void drawUI() {
         display.setCursor(0, 20); display.print("Conectando...");
     }
     else if (currentState == STATE_MINING) {
-        display.setCursor(0, 0); display.print("BTC MINER v1.5");
+        display.setCursor(0, 0); display.print("BTC MINER v1.6");
         display.drawLine(0, 10, 128, 10, WHITE);
         String statusShort = poolStatus.substring(0, 21);
         display.setCursor(0, 15); display.print(statusShort);
@@ -307,10 +326,21 @@ void drawUI() {
         display.setCursor(0, 45);
         display.print("Ok:"); display.print(acceptedShares);
         display.print(" Rj:"); display.print(rejectedShares);
-        // Dificuldade e best diff
+        display.print(" S:"); display.print(sharesSubmitted);
+        // Dificuldade e best diff - mais casas decimais
         display.setCursor(0, 55);
-        display.print("D:"); display.print(currentPoolDifficulty, 2);
-        display.print(" B:"); display.print(bestDiff, 0);
+        display.print("pD:");
+        if (currentPoolDifficulty < 0.01) {
+            display.print(currentPoolDifficulty, 4);
+        } else {
+            display.print(currentPoolDifficulty, 1);
+        }
+        display.print(" b:");
+        if (bestDiff < 0.01) {
+            display.print(bestDiff, 4);
+        } else {
+            display.print(bestDiff, 1);
+        }
     }
     display.display();
 }
@@ -320,9 +350,13 @@ void drawUI() {
 // ============================================================
 
 void submitShare(uint32_t nonce, const String& extranonce2) {
+    // Formata nonce como hex (igual ao NerdMiner_v2: SEM padding)
     String nonceHex = String(nonce, HEX);
-    while (nonceHex.length() < 8) nonceHex = "0" + nonceHex;
-    String payload = "{\"id\":" + String(stratumMsgId++) +
+    unsigned long thisId = stratumMsgId++;
+    trackSubmitId(thisId);  // Registra como submit REAL
+    sharesSubmitted++;
+
+    String payload = "{\"id\":" + String(thisId) +
         ",\"method\":\"mining.submit\",\"params\":[\"" +
         String(WORKER_ID) + "\",\"" +
         current_job_id + "\",\"" +
@@ -331,23 +365,17 @@ void submitShare(uint32_t nonce, const String& extranonce2) {
         nonceHex + "\"]}\n";
     client.print(payload);
     lastPoolDataTime = millis();
-    Serial.printf("[SHARE] Submitted nonce=%08x job=%s\n", nonce, current_job_id.c_str());
+    Serial.printf("[SHARE] Submitted id=%lu nonce=%08x job=%s en2=%s\n",
+        thisId, nonce, current_job_id.c_str(), extranonce2.c_str());
 }
 
 void suggestDifficulty(double diff) {
     char buf[128];
-    snprintf(buf, sizeof(buf), "{\"id\":%d,\"method\":\"mining.suggest_difficulty\",\"params\":[%.10g]}\n", stratumMsgId++, diff);
+    // NÃO usa stratumMsgId para não conflitar com IDs de submit
+    // Usa sempre id=3 como NerdMiner_v2 (resposta é ignorada)
+    snprintf(buf, sizeof(buf), "{\"id\":3,\"method\":\"mining.suggest_difficulty\",\"params\":[%.10g]}\n", diff);
     client.print(buf);
     lastPoolDataTime = millis();
-}
-
-void sendMiningConfigure() {
-    // mining.configure com minimum-difficulty = pedido OBRIGATÓRIO (não sugestão)
-    // Alguns pools (Eloipool, public-pool forks) respeitam como diff mínimo garantido
-    String payload = "{\"id\":3,\"method\":\"mining.configure\",\"params\":[{\"minimum-difficulty\":true},null]}\n";
-    client.print(payload);
-    lastPoolDataTime = millis();
-    Serial.println("[STRATUM] >> mining.configure (minimum-difficulty)");
 }
 
 void processStratum(String line) {
@@ -391,18 +419,17 @@ void processStratum(String line) {
                 Serial.println();
             }
         }
-        // Resposta ao mining.configure (id=3) - apenas log, não é share
+        // Resposta ao mining.suggest_difficulty (id=3) - ignorar (não é share)
         else if (id == 3) {
-            Serial.print("[STRATUM] configure response: ");
-            serializeJson(g_doc["result"], Serial);
-            Serial.println();
+            // Resposta do suggest_difficulty - ignorar silenciosamente
         }
-        // Resposta ao mining.suggest_difficulty (id=4) - apenas log
-        else if (id == 4) {
-            // Pool pode retornar true ou erro - ambos ok, não é share
-        }
-        // Respostas ao mining.submit (id >= 5)
-        else if (id >= 5) {
+        // Respostas ao mining.submit (id >= 4) - VERIFICAR se é submit REAL
+        else if (id >= 4) {
+            // CRÍTICO: só processar se este ID foi usado num submit real
+            if (!isRealSubmitId(id)) {
+                // Não é um submit real (não deve acontecer com novo código)
+                return;
+            }
             if (g_doc["result"] == true) {
                 acceptedShares++;
                 Serial.println("[SHARE] *** ACCEPTED! ***");
@@ -466,7 +493,9 @@ void connectToStratum() {
     isSubscribed = false;
     isAuthorized = false;
     isConnected = false;
-    stratumMsgId = 5;
+    stratumMsgId = 4;  // 1=subscribe, 2=auth, 3=suggest, 4+=submit
+    submitIdCount = 0;
+    sharesSubmitted = 0;
     current_job_id = "";
     currentPoolDifficulty = DEFAULT_DIFFICULTY;
     lastSuggestTime = 0;
@@ -504,25 +533,19 @@ void connectToStratum() {
         return;
     }
 
-    // 2) mining.authorize
+    // 2) mining.authorize (igual NerdMiner_v2)
     String auth = "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" +
                  String(WORKER_ID) + "\",\"" + String(WORKER_PASS) + "\"]}\n";
     client.print(auth);
     Serial.printf("[STRATUM] >> mining.authorize (%s)\n", WORKER_ID);
 
-    delay(100);
+    delay(200);
 
-    // 3) mining.configure - pedido OBRIGATÓRIO de diff mínimo (mais forte que suggest)
-    sendMiningConfigure();
-    delay(100);
-
-    // 4) mining.suggest_difficulty
-    stratumMsgId = 4;
+    // 3) mining.suggest_difficulty (igual NerdMiner_v2 - usa id=3 fixo)
     suggestDifficulty(DEFAULT_DIFFICULTY);
     Serial.printf("[STRATUM] >> suggest_difficulty(%.10g)\n", DEFAULT_DIFFICULTY);
-    stratumMsgId = 5;  // Próximos IDs são para mining.submit
 
-    // 5) Le qualquer dado pendente (pode incluir authorize, configure, set_difficulty, notify)
+    // 4) Le qualquer dado pendente (authorize response, set_difficulty, notify)
     delay(200);
     while (client.available()) {
         String line = client.readStringUntil('\n');
@@ -724,7 +747,7 @@ void handleButtons() {
 
 void setup() {
     Serial.begin(115200);
-    Serial.println("\n\n=== ESP32 BTC Miner v1.5 ===");
+    Serial.println("\n\n=== ESP32 BTC Miner v1.6 ===");
 
     pinMode(BTN_UP, INPUT_PULLUP); pinMode(BTN_DOWN, INPUT_PULLUP);
     pinMode(BTN_SEL, INPUT_PULLUP); pinMode(BTN_BACK, INPUT_PULLUP);
