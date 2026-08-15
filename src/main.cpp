@@ -289,7 +289,7 @@ void drawUI() {
         display.setCursor(0, 20); display.print("Conectando...");
     }
     else if (currentState == STATE_MINING) {
-        display.setCursor(0, 0); display.print("BTC MINER v1.4");
+        display.setCursor(0, 0); display.print("BTC MINER v1.5");
         display.drawLine(0, 10, 128, 10, WHITE);
         String statusShort = poolStatus.substring(0, 21);
         display.setCursor(0, 15); display.print(statusShort);
@@ -341,6 +341,15 @@ void suggestDifficulty(double diff) {
     lastPoolDataTime = millis();
 }
 
+void sendMiningConfigure() {
+    // mining.configure com minimum-difficulty = pedido OBRIGATÓRIO (não sugestão)
+    // Alguns pools (Eloipool, public-pool forks) respeitam como diff mínimo garantido
+    String payload = "{\"id\":3,\"method\":\"mining.configure\",\"params\":[{\"minimum-difficulty\":true},null]}\n";
+    client.print(payload);
+    lastPoolDataTime = millis();
+    Serial.println("[STRATUM] >> mining.configure (minimum-difficulty)");
+}
+
 void processStratum(String line) {
     if (line.length() < 2) return;
 
@@ -382,8 +391,18 @@ void processStratum(String line) {
                 Serial.println();
             }
         }
-        // Respostas ao mining.submit (id >= 3)
-        else if (id >= 3) {
+        // Resposta ao mining.configure (id=3) - apenas log, não é share
+        else if (id == 3) {
+            Serial.print("[STRATUM] configure response: ");
+            serializeJson(g_doc["result"], Serial);
+            Serial.println();
+        }
+        // Resposta ao mining.suggest_difficulty (id=4) - apenas log
+        else if (id == 4) {
+            // Pool pode retornar true ou erro - ambos ok, não é share
+        }
+        // Respostas ao mining.submit (id >= 5)
+        else if (id >= 5) {
             if (g_doc["result"] == true) {
                 acceptedShares++;
                 Serial.println("[SHARE] *** ACCEPTED! ***");
@@ -447,7 +466,7 @@ void connectToStratum() {
     isSubscribed = false;
     isAuthorized = false;
     isConnected = false;
-    stratumMsgId = 3;
+    stratumMsgId = 5;
     current_job_id = "";
     currentPoolDifficulty = DEFAULT_DIFFICULTY;
     lastSuggestTime = 0;
@@ -485,7 +504,7 @@ void connectToStratum() {
         return;
     }
 
-    // 2) mining.authorize (NÃO lemos a resposta aqui - deixamos o loop principal tratar)
+    // 2) mining.authorize
     String auth = "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" +
                  String(WORKER_ID) + "\",\"" + String(WORKER_PASS) + "\"]}\n";
     client.print(auth);
@@ -493,11 +512,17 @@ void connectToStratum() {
 
     delay(100);
 
-    // 3) mining.suggest_difficulty
+    // 3) mining.configure - pedido OBRIGATÓRIO de diff mínimo (mais forte que suggest)
+    sendMiningConfigure();
+    delay(100);
+
+    // 4) mining.suggest_difficulty
+    stratumMsgId = 4;
     suggestDifficulty(DEFAULT_DIFFICULTY);
     Serial.printf("[STRATUM] >> suggest_difficulty(%.10g)\n", DEFAULT_DIFFICULTY);
+    stratumMsgId = 5;  // Próximos IDs são para mining.submit
 
-    // 4) Le qualquer dado pendente (pode incluir authorize response, set_difficulty, notify)
+    // 5) Le qualquer dado pendente (pode incluir authorize, configure, set_difficulty, notify)
     delay(200);
     while (client.available()) {
         String line = client.readStringUntil('\n');
@@ -605,11 +630,11 @@ void miningLoop() {
         double hashDiff = diffFromTarget(hashLe);
         if (hashDiff > bestDiff) bestDiff = hashDiff;
 
-        // Conta shares locais (diff >= 0.0001) para mostrar atividade
-        if (hashDiff >= 0.0001) {
+        // Conta shares locais (diff >= 0.00001) para mostrar atividade
+        if (hashDiff >= 0.00001) {
             localShares++;
-            if (localShares <= 3 || localShares % 50 == 0) {
-                Serial.printf("[LOCAL] diff=%.6f nonce=%08x (total:%lu best:%.4f)\n", hashDiff, nonce, localShares, bestDiff);
+            if (localShares <= 5 || localShares % 20 == 0) {
+                Serial.printf("[LOCAL] diff=%.6f nonce=%08x (total:%lu best:%.6f)\n", hashDiff, nonce, localShares, bestDiff);
             }
         }
 
@@ -640,7 +665,7 @@ void miningLoop() {
         // Log de hashrate a cada 5 segundos
         static unsigned long lastHRLog = 0;
         if (now2 - lastHRLog >= 5000) {
-            Serial.printf("[STATS] H/s=%.0f total=%luk local=%lu best=%.4f poolDiff=%.4f\n",
+            Serial.printf("[STATS] H/s=%.0f total=%luk local=%lu best=%.6f poolDiff=%.6f\n",
                 hashrate, hashesTotal/1000, localShares, bestDiff, currentPoolDifficulty);
             lastHRLog = now2;
         }
@@ -699,7 +724,7 @@ void handleButtons() {
 
 void setup() {
     Serial.begin(115200);
-    Serial.println("\n\n=== ESP32 BTC Miner v1.4 ===");
+    Serial.println("\n\n=== ESP32 BTC Miner v1.5 ===");
 
     pinMode(BTN_UP, INPUT_PULLUP); pinMode(BTN_DOWN, INPUT_PULLUP);
     pinMode(BTN_SEL, INPUT_PULLUP); pinMode(BTN_BACK, INPUT_PULLUP);
