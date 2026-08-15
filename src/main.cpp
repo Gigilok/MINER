@@ -28,6 +28,10 @@ const char* WORKER_ID = "1FRpCfmiwAGVkCLt2FjVuuoAjhSaE2j4QN.esp32";
 const char* WORKER_PASS = "x";
 const double DEFAULT_DIFFICULTY = 0.00015;
 
+// Tamanho do JSON - CRÍTICO: mining.notify pode ter >2KB
+// NerdMiner_v2 usa 4096, usamos 6144 para margem de segurança
+#define JSON_DOC_SIZE 6144
+
 enum UI_State { STATE_SCANNING, STATE_SELECT_SSID, STATE_INPUT_PASSWORD, STATE_CONNECTING, STATE_MINING };
 UI_State currentState = STATE_SCANNING;
 
@@ -44,7 +48,7 @@ double bestDiff = 0.0;
 unsigned long lastHashTime = 0;
 unsigned long hashesInWindow = 0;
 
-// Contador local de shares (diff >= 0.001) para mostrar atividade na tela
+// Contador local de shares (diff >= 0.001)
 unsigned long localShares = 0;
 
 char chars[] = " abcdefghijklmnopqrstuvwxyz0123456789@!#$%&*";
@@ -67,11 +71,17 @@ String current_nbits_hex = "";
 String current_ntime_hex = "";
 bool isSubscribed = false;
 bool isAuthorized = false;
+bool isConnected = false;
 
-uint8_t target_le[32] = {0};
 unsigned long extranonce2_val = 1;
 int stratumMsgId = 3;
+
+// Timers
 unsigned long lastSuggestTime = 0;
+unsigned long lastJobTime = 0;
+unsigned long lastPoolDataTime = 0;
+#define KEEPALIVE_MS 30000
+#define POOL_INACTIVITY_MS 120000
 
 // --- BUZINA ---
 void buzzerInit() { pinMode(BUZZER, INPUT); }
@@ -158,25 +168,6 @@ double diffFromTarget(const uint8_t* hashLe) {
     return truediffone / d;
 }
 
-void nbitsToTarget(const String& nbitsHex, uint8_t* targetOut) {
-    String expStr = nbitsHex.substring(0, 2);
-    int exponent = (int)strtol(expStr.c_str(), NULL, 16);
-    String coeff = nbitsHex.substring(2);
-    memset(targetOut, 0, 32);
-    int zeroBytes = exponent - 3;
-    if (zeroBytes < 0) zeroBytes = 0;
-    if (zeroBytes > 29) zeroBytes = 29;
-    int coeffLen = coeff.length() / 2;
-    if (zeroBytes + coeffLen > 32) coeffLen = 32 - zeroBytes;
-    for (int i = 0; i < coeffLen; i++) {
-        uint8_t b = 0;
-        if (i * 2 < coeff.length()) b = hexCharToVal(coeff.charAt(i * 2)) << 4;
-        if (i * 2 + 1 < coeff.length()) b |= hexCharToVal(coeff.charAt(i * 2 + 1));
-        targetOut[zeroBytes + coeffLen - 1 - i] = b;
-    }
-    reverseBytes(targetOut, 32);
-}
-
 String formatExtranonce2(unsigned long val, int size) {
     String hex = String(val, HEX);
     int neededChars = size * 2;
@@ -186,17 +177,23 @@ String formatExtranonce2(unsigned long val, int size) {
 }
 
 // ============================================================
-// CONSTRUIR BLOCK HEADER
+// CONSTRUIR BLOCK HEADER (80 bytes)
 // ============================================================
+// Layout: version(4) + prevhash(32) + merkle_root(32) + ntime(4) + nbits(4) + nonce(4)
 
 bool buildBlockHeader(const String& extranonce2, uint8_t* headerOut) {
+    // Monta coinbase: coinb1 + extranonce1 + extranonce2 + coinb2
     String coinbaseHex = current_coinb1 + extranonce1 + extranonce2 + current_coinb2;
     int cbLen = coinbaseHex.length() / 2;
-    if (cbLen <= 0 || cbLen > 256) return false;
+    if (cbLen <= 0 || cbLen > 256) {
+        Serial.printf("[ERROR] Coinbase invalido: len=%d\n", cbLen);
+        return false;
+    }
 
     uint8_t coinbaseBytes[256];
     hexToBytes(coinbaseHex, coinbaseBytes);
 
+    // Calcula merkle root
     uint8_t merkleRoot[32];
     doubleSHA256(coinbaseBytes, cbLen, merkleRoot);
 
@@ -210,14 +207,21 @@ bool buildBlockHeader(const String& extranonce2, uint8_t* headerOut) {
         doubleSHA256(buf, 64, merkleRoot);
     }
 
+    // Preenche header (tudo little-endian)
+    // Version
     hexToBytes(reverseHex(current_version_hex), &headerOut[0]);
+    // Previous hash
     hexToBytes(reverseHex(current_prevhash), &headerOut[4]);
+    // Merkle root (BE → inverter para LE)
     uint8_t merkleLe[32];
     memcpy(merkleLe, merkleRoot, 32);
     reverseBytes(merkleLe, 32);
     memcpy(&headerOut[36], merkleLe, 32);
+    // ntime
     hexToBytes(reverseHex(current_ntime_hex), &headerOut[68]);
+    // nbits
     hexToBytes(reverseHex(current_nbits_hex), &headerOut[72]);
+    // nonce (preenchido depois no mining loop)
     memset(&headerOut[76], 0, 4);
     return true;
 }
@@ -268,9 +272,8 @@ void drawUI() {
         display.setCursor(0, 20); display.print("Conectando...");
     }
     else if (currentState == STATE_MINING) {
-        display.setCursor(0, 0); display.print("BTC MINER v1.2");
+        display.setCursor(0, 0); display.print("BTC MINER v1.3");
         display.drawLine(0, 10, 128, 10, WHITE);
-        // Status (truncado para caber)
         String statusShort = poolStatus.substring(0, 21);
         display.setCursor(0, 15); display.print(statusShort);
         // Hashrate
@@ -310,53 +313,63 @@ void submitShare(uint32_t nonce, const String& extranonce2) {
         current_ntime_hex + "\",\"" +
         nonceHex + "\"]}\n";
     client.print(payload);
-    Serial.printf("[SHARE] Submitted nonce=%08x\n", nonce);
+    lastPoolDataTime = millis();
+    Serial.printf("[SHARE] Submitted nonce=%08x job=%s\n", nonce, current_job_id.c_str());
 }
 
 void suggestDifficulty(double diff) {
     char buf[128];
     snprintf(buf, sizeof(buf), "{\"id\":%d,\"method\":\"mining.suggest_difficulty\",\"params\":[%.10g]}\n", stratumMsgId++, diff);
     client.print(buf);
+    lastPoolDataTime = millis();
 }
 
 void processStratum(String line) {
     if (line.length() < 2) return;
-    StaticJsonDocument<2048> doc;
+
+    StaticJsonDocument<JSON_DOC_SIZE> doc;
     DeserializationError error = deserializeJson(doc, line);
-    if (error) return;
-
-    // Resposta ao mining.subscribe (id=1)
-    if (doc.containsKey("id") && doc["id"] == 1) {
-        if (doc["result"].is<JsonArray>()) {
-            JsonArray arr = doc["result"].as<JsonArray>();
-            extranonce1 = arr[1].as<String>();
-            extranonce2_size = arr[2].as<int>();
-            if (extranonce2_size <= 0) extranonce2_size = 4;
-            extranonce2_val = 1;
-            isSubscribed = true;
-            Serial.printf("[STRATUM] Subscribed. en1=%s size=%d\n", extranonce1.c_str(), extranonce2_size);
-        }
+    if (error) {
+        Serial.printf("[JSON ERRO] len=%d err=%s\n", line.length(), error.c_str());
+        return;
     }
 
-    // Resposta ao mining.authorize (id=2)
-    if (doc.containsKey("id") && doc["id"] == 2) {
-        if (doc["result"] == true) {
-            isAuthorized = true;
-            poolStatus = "Logado! Minerando...";
-            Serial.println("[STRATUM] Authorized OK!");
-        } else {
-            poolStatus = "ERRO: Login!";
-            Serial.println("[STRATUM] Authorization FAILED!");
-        }
-    }
+    lastPoolDataTime = millis();
 
-    // Respostas ao mining.submit (id >= 3)
+    // --- Resposta ao mining.subscribe (id=1) ---
     if (doc.containsKey("id")) {
         int id = doc["id"].as<int>();
-        if (id >= 3) {
+
+        if (id == 1 && !isSubscribed) {
+            // Resposta do subscribe
+            if (doc["result"].is<JsonArray>()) {
+                JsonArray arr = doc["result"].as<JsonArray>();
+                extranonce1 = arr[1].as<String>();
+                extranonce2_size = arr[2].as<int>();
+                if (extranonce2_size <= 0) extranonce2_size = 4;
+                extranonce2_val = 1;
+                isSubscribed = true;
+                Serial.printf("[STRATUM] Subscribed OK! en1=%s size=%d\n", extranonce1.c_str(), extranonce2_size);
+            }
+        }
+        // Resposta ao mining.authorize (id=2)
+        else if (id == 2 && !isAuthorized) {
+            if (doc["result"] == true) {
+                isAuthorized = true;
+                poolStatus = "Logado! Minerando...";
+                Serial.println("[STRATUM] Authorized OK!");
+            } else if (doc.containsKey("error") && !doc["error"].isNull()) {
+                poolStatus = "ERRO: Login!";
+                Serial.print("[STRATUM] Auth FAILED: ");
+                serializeJson(doc["error"], Serial);
+                Serial.println();
+            }
+        }
+        // Respostas ao mining.submit (id >= 3)
+        else if (id >= 3) {
             if (doc["result"] == true) {
                 acceptedShares++;
-                Serial.println("[SHARE] ACCEPTED!");
+                Serial.println("[SHARE] *** ACCEPTED! ***");
                 buzzerAlertSuccess();
             } else {
                 rejectedShares++;
@@ -367,46 +380,63 @@ void processStratum(String line) {
         }
     }
 
+    // --- Notificações do pool (method) ---
     if (doc.containsKey("method")) {
         const char* method = doc["method"];
 
         if (strcmp(method, "mining.set_difficulty") == 0) {
             double newDiff = doc["params"][0].as<double>();
             currentPoolDifficulty = newDiff;
-            Serial.printf("[STRATUM] Pool diff: %f\n", newDiff);
-            // Se dificuldade alta, re-sugere imediatamente
-            if (newDiff > DEFAULT_DIFFICULTY * 2) {
-                suggestDifficulty(DEFAULT_DIFFICULTY);
-                Serial.printf("[STRATUM] Suggested %.10g\n", DEFAULT_DIFFICULTY);
-            }
+            Serial.printf("[STRATUM] Pool set diff: %.6f\n", newDiff);
         }
 
         if (strcmp(method, "mining.notify") == 0) {
-            current_job_id = doc["params"][0].as<String>();
+            String newJobId = doc["params"][0].as<String>();
             current_prevhash = doc["params"][1].as<String>();
             current_coinb1 = doc["params"][2].as<String>();
             current_coinb2 = doc["params"][3].as<String>();
+
+            // Merkle branches
             num_branches = 0;
             JsonArray branches = doc["params"][4];
             for (int i = 0; i < 16 && i < branches.size(); i++) {
                 if (!branches[i].isNull())
                     merkle_branches[num_branches++] = branches[i].as<String>();
             }
+
             current_version_hex = doc["params"][5].as<String>();
             current_nbits_hex = doc["params"][6].as<String>();
             current_ntime_hex = doc["params"][7].as<String>();
-            nbitsToTarget(current_nbits_hex, target_le);
+
+            current_job_id = newJobId;
             extranonce2_val = 1;
+            lastJobTime = millis();
+
+            Serial.printf("[JOB] job=%s prev=%s... nbits=%s ntime=%s branches=%d\n",
+                current_job_id.c_str(),
+                current_prevhash.substring(0, 16).c_str(),
+                current_nbits_hex.c_str(),
+                current_ntime_hex.c_str(),
+                num_branches);
         }
     }
 }
+
+// ============================================================
+// CONEXÃO STRATUM (como NerdMiner_v2)
+// ============================================================
 
 void connectToStratum() {
     poolStatus = "Conectando Pool...";
     isSubscribed = false;
     isAuthorized = false;
+    isConnected = false;
     stratumMsgId = 3;
+    current_job_id = "";
     currentPoolDifficulty = DEFAULT_DIFFICULTY;
+    lastSuggestTime = 0;
+    lastJobTime = 0;
+    lastPoolDataTime = 0;
 
     if (!client.connect(STRATUM_HOST, STRATUM_PORT)) {
         poolStatus = "ERRO: Conexao";
@@ -414,13 +444,16 @@ void connectToStratum() {
         return;
     }
     Serial.printf("[STRATUM] Connected to %s:%d\n", STRATUM_HOST, STRATUM_PORT);
+    isConnected = true;
+    lastPoolDataTime = millis();
 
-    // 1) Subscribe (user agent NerdMinerV2 para pool dar diff baixa)
-    String sub = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"NerdMinerV2/V1.8.3\"]}\n";
+    // 1) mining.subscribe (user agent NerdMinerV2 para pool reconhecer e dar diff baixa)
+    String sub = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"NerdMinerV2/V2.0.3\"]}\n";
     client.print(sub);
-    delay(200); // espera resposta
+    Serial.println("[STRATUM] >> mining.subscribe");
 
-    // Lê resposta do subscribe
+    // Espera e le resposta do subscribe
+    delay(500);
     while (client.available()) {
         String line = client.readStringUntil('\n');
         line.trim();
@@ -428,37 +461,44 @@ void connectToStratum() {
     }
 
     if (!isSubscribed) {
-        Serial.println("[STRATUM] Subscribe failed");
+        Serial.println("[STRATUM] Subscribe FAILED - no valid response");
         poolStatus = "ERRO: Subscribe";
+        client.stop();
+        isConnected = false;
         return;
     }
 
-    // 2) Authorize
+    // 2) mining.authorize (NÃO lemos a resposta aqui - deixamos o loop principal tratar)
     String auth = "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" +
                  String(WORKER_ID) + "\",\"" + String(WORKER_PASS) + "\"]}\n";
     client.print(auth);
-    delay(200);
+    Serial.printf("[STRATUM] >> mining.authorize (%s)\n", WORKER_ID);
 
-    // Lê resposta do authorize
+    delay(100);
+
+    // 3) mining.suggest_difficulty
+    suggestDifficulty(DEFAULT_DIFFICULTY);
+    Serial.printf("[STRATUM] >> suggest_difficulty(%.10g)\n", DEFAULT_DIFFICULTY);
+
+    // 4) Le qualquer dado pendente (pode incluir authorize response, set_difficulty, notify)
+    delay(200);
     while (client.available()) {
         String line = client.readStringUntil('\n');
         line.trim();
         if (line.length() > 0) processStratum(line);
     }
 
-    // 3) Suggest difficulty baixa
-    suggestDifficulty(DEFAULT_DIFFICULTY);
-    lastSuggestTime = millis();
-
-    poolStatus = "Aguardando diff...";
+    poolStatus = "Aguardando job...";
     beep(100);
 }
 
 // ============================================================
-// MINING LOOP - REESCRITO PARA ESTABILIDADE
+// MINING LOOP
 // ============================================================
 
 void miningLoop() {
+    unsigned long now = millis();
+
     // 1. Processa TODAS mensagens pendentes da pool
     while (client.available()) {
         String line = client.readStringUntil('\n');
@@ -466,36 +506,57 @@ void miningLoop() {
         if (line.length() > 0) processStratum(line);
     }
 
-    // 2. Reconexão
+    // 2. Verifica conexão
     if (!client.connected()) {
+        Serial.println("[STRATUM] Connection lost! Reconnecting...");
         poolStatus = "Reconectando...";
-        current_job_id = "";
+        client.stop();
+        isConnected = false;
         isSubscribed = false;
         isAuthorized = false;
-        client.stop();
+        current_job_id = "";
         delay(3000);
         connectToStratum();
         return;
     }
 
-    // 3. Re-sugest difficulty periodicamente (a cada 10s)
-    if (millis() - lastSuggestTime > 10000 && currentPoolDifficulty > DEFAULT_DIFFICULTY * 2) {
-        suggestDifficulty(DEFAULT_DIFFICULTY);
-        lastSuggestTime = millis();
-        Serial.printf("[STRATUM] Re-suggesting diff %.10g\n", DEFAULT_DIFFICULTY);
-    }
-
-    // 4. Só minera se autorizado e tem job
-    if (!isAuthorized || current_job_id.length() == 0 || !isSubscribed) {
+    // 3. Detecta inatividade do pool (sem dados por 2 minutos)
+    if (now - lastPoolDataTime > POOL_INACTIVITY_MS) {
+        Serial.println("[STRATUM] Pool inactivity timeout. Reconnecting...");
+        poolStatus = "Timeout Pool...";
+        client.stop();
+        isConnected = false;
+        isSubscribed = false;
+        isAuthorized = false;
+        current_job_id = "";
+        delay(2000);
+        connectToStratum();
         return;
     }
 
-    // 5. Prepara dados de mineração
+    // 4. Keep-alive: envia suggest_difficulty a cada 30s se não enviamos nada
+    if (now - lastPoolDataTime > KEEPALIVE_MS) {
+        suggestDifficulty(currentPoolDifficulty);
+        Serial.println("[STRATUM] Keep-alive sent");
+        lastSuggestTime = now;
+    }
+
+    // 5. Só minera se autorizado e tem job
+    if (!isAuthorized || current_job_id.length() == 0 || !isSubscribed) {
+        if (!isAuthorized && isSubscribed) {
+            poolStatus = "Aguardando auth...";
+        } else if (isAuthorized && current_job_id.length() == 0) {
+            poolStatus = "Aguardando job...";
+        }
+        return;
+    }
+
+    // 6. Prepara dados de mineração
     String extranonce2 = formatExtranonce2(extranonce2_val, extranonce2_size);
     uint8_t blockheader[80];
     if (!buildBlockHeader(extranonce2, blockheader)) return;
 
-    // 6. Minera por 50ms (reduzido de 100ms para não travar WiFi)
+    // 7. Minera por 50ms
     unsigned long loopStart = millis();
     uint32_t nonce = esp_random();
     unsigned int localH = 0;
@@ -507,6 +568,7 @@ void miningLoop() {
         doubleSHA256(blockheader, 80, hashBe);
         localH++;
 
+        // Converte hash para LE para calcular dificuldade
         uint8_t hashLe[32];
         memcpy(hashLe, hashBe, 32);
         reverseBytes(hashLe, 32);
@@ -517,14 +579,16 @@ void miningLoop() {
         // Conta shares locais (diff >= 0.001) para mostrar atividade
         if (hashDiff >= 0.001) {
             localShares++;
-            Serial.printf("[LOCAL] diff=%.4f nonce=%08x\n", hashDiff, nonce);
+            // Só loga a cada 10 shares locais para não encher o serial
+            if (localShares % 10 == 0) {
+                Serial.printf("[LOCAL] diff=%.4f nonce=%08x (total local: %lu)\n", hashDiff, nonce, localShares);
+            }
         }
 
         // Submete se atende dificuldade da pool
         if (hashDiff >= currentPoolDifficulty) {
-            Serial.printf("[FOUND] diff=%f nonce=%08x\n", hashDiff, nonce);
+            Serial.printf("[FOUND] diff=%f nonce=%08x job=%s\n", hashDiff, nonce, current_job_id.c_str());
             submitShare(nonce, extranonce2);
-            buzzerAlertSuccess();
         }
 
         nonce++;
@@ -538,8 +602,7 @@ void miningLoop() {
     hashesTotal += localH;
     hashesInWindow += localH;
 
-    // 7. Hashrate
-    unsigned long now = millis();
+    // 8. Hashrate (janela de 1 segundo)
     if (now - lastHashTime >= 1000) {
         double elapsed = (double)(now - lastHashTime) / 1000.0;
         hashrate = (double)hashesInWindow / elapsed;
@@ -547,7 +610,7 @@ void miningLoop() {
         lastHashTime = now;
     }
 
-    // 8. Atualiza status da tela
+    // 9. Atualiza status da tela
     if (hashrate > 100) {
         poolStatus = "Minerando " + String((unsigned long)hashrate) + " H/s";
     }
@@ -600,7 +663,7 @@ void handleButtons() {
 
 void setup() {
     Serial.begin(115200);
-    Serial.println("\n\n=== ESP32 BTC Miner v1.2 ===");
+    Serial.println("\n\n=== ESP32 BTC Miner v1.3 ===");
 
     pinMode(BTN_UP, INPUT_PULLUP); pinMode(BTN_DOWN, INPUT_PULLUP);
     pinMode(BTN_SEL, INPUT_PULLUP); pinMode(BTN_BACK, INPUT_PULLUP);
@@ -611,9 +674,6 @@ void setup() {
         Serial.println("OLED not found!"); for (;;);
     }
     drawSplashScreen();
-
-    // NAO desabilita WDT - isso causava queda de WiFi
-    // disableCore0WDT(); // REMOVIDO
 
     preferences.begin("wifi", false);
     ssid = preferences.getString("ssid", "");
