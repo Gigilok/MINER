@@ -22,11 +22,11 @@
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 Preferences preferences;
 
-// --- POOL ---
-const char* STRATUM_HOST = "public-pool.io";
+// --- POOL (BRAIINS) ---
+const char* STRATUM_HOST = "stratum.braiins.com";
 const int STRATUM_PORT = 3333;
 const char* WORKER_ID = "cliquefeira.esp32";
-const char* WORKER_PASS = "x";
+const char* WORKER_PASS = "anything123";
 const double DEFAULT_DIFFICULTY = 0.00015;
 const unsigned long KEEPALIVE_MS = 30000;
 
