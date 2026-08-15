@@ -22,8 +22,8 @@
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 Preferences preferences;
 
-// --- CONFIGURAÇÃO DA MINERAÇÃO (BTC) ---
-const char* STRATUM_HOST = "solo.ckpool.org";
+// --- CONFIGURAÇÃO DA MINERAÇÃO (BTC EM CONJUNTO - POOL) ---
+const char* STRATUM_HOST = "stratum.braiins.com";
 const int STRATUM_PORT = 3333;
 const char* BTC_WALLET = "1FRpCfmiwAGVkCLt2FjVuuoAjhSaE2j4QN";
 const char* WORKER_NAME = "esp32";
@@ -57,7 +57,7 @@ double hashrate = 0.0;
 char chars[] = " abcdefghijklmnopqrstuvwxyz0123456789@!#$%&*";
 int charIndex = 0;
 
-// --- FUNÇÕES DA BUZINA (Modo 2000Hz Alto) ---
+// --- FUNÇÕES DA BUZINA ---
 void buzzerInit() {
     pinMode(BUZZER, INPUT);
 }
@@ -82,15 +82,15 @@ void buzzerAlertSuccess() {
     beep(300);
 }
 
-// --- TELA DE INICIALIZAÇÃO (MINER) ---
+// --- TELA DE INICIALIZAÇÃO ---
 void drawSplashScreen() {
   display.clearDisplay();
-  display.setTextSize(3); // Texto bem grande
+  display.setTextSize(3);
   display.setTextColor(WHITE);
   display.setCursor(15, 15);
   display.print("MINER");
   display.display();
-  delay(2000); // Fica 2 segundos na tela
+  delay(2000);
 }
 
 // --- DESENHO DA TELA ---
@@ -116,7 +116,6 @@ void drawUI() {
     display.setCursor(0, 0);
     display.print("Redes Wi-Fi:");
     display.drawLine(0, 10, 128, 10, WHITE);
-    
     for (int i = 0; i < 5; i++) {
       if (selectedNetworkIndex + i < scanNetworksCount) {
         display.setCursor(0, 15 + (i * 10));
@@ -130,15 +129,12 @@ void drawUI() {
     display.print("Rede: ");
     display.print(ssid.substring(0, 14));
     display.drawLine(0, 10, 128, 10, WHITE);
-    
     display.setCursor(0, 15);
     display.print("Senha: ");
     for(int i=0; i<password.length(); i++) display.print("*");
-    
     display.setCursor(0, 30);
     display.print("> Char: ");
     display.print(chars[charIndex]);
-    
     display.setCursor(0, 45);
     display.print("SEL: Add BCK: Del");
     display.setCursor(0, 55);
@@ -150,7 +146,7 @@ void drawUI() {
   }
   else if (currentState == STATE_MINING) {
     display.setCursor(0, 0);
-    display.print("BTC MINER");
+    display.print("BTC POOL MINER"); // Mudei para POOL
     display.drawLine(0, 10, 128, 10, WHITE);
     display.setCursor(0, 15);
     display.print("Rede: ");
@@ -160,11 +156,9 @@ void drawUI() {
     display.setCursor(0, 35);
     display.print("H/s: ");
     display.print(hashrate, 1);
-    
     display.setCursor(0, 45);
     display.print("Acertos: ");
     display.print(acceptedShares);
-    
     display.setCursor(0, 55);
     display.print("BCK+DOWN: Resetar");
   }
@@ -177,6 +171,7 @@ void connectToStratum() {
     miningConnected = false;
     return;
   }
+  // Na Braiins Pool, o usuário é a sua carteira
   String subscribe = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"esp32-miner/1.0\"]}\n";
   client.print(subscribe);
   String auth = "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" + String(BTC_WALLET) + "." + String(WORKER_NAME) + "\",\"x\"]}\n";
@@ -188,15 +183,11 @@ void connectToStratum() {
 void miningLoop() {
   while (client.available()) {
     String line = client.readStringUntil('\n');
-    
-    // Ignora a resposta de login (id:2) que tambem tem result:true
-    // So dispara o acerto se for resposta de envio de bloco (id:4 ou superior)
     if (line.indexOf("\"id\":2") == -1 && line.indexOf("\"result\":true") != -1) {
       acceptedShares++;
       buzzerAlertSuccess();
     }
   }
-
   unsigned long startTime = millis();
   unsigned long hashesThisLoop = 0;
   while (millis() - startTime < 1000) {
@@ -299,10 +290,8 @@ void setup() {
     for(;;);
   }
   
-  // 1. Mostra a tela MINER logo ao ligar
   drawSplashScreen();
   
-  // 2. Tenta carregar Wi-Fi salvo
   preferences.begin("wifi", false);
   ssid = preferences.getString("ssid", "");
   password = preferences.getString("pass", "");
