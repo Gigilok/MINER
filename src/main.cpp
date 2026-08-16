@@ -36,7 +36,7 @@ const char* STRATUM_HOST = "pool.nerdminer.io";
 const int STRATUM_PORT = 3333;
 // Apenas o endereço BTC - igual ao NerdMiner_v2
 // O sufixo .esp32 impedia o painel de reconhecer o worker
-const char* WORKER_ID = "bc1qatm8zewhemwlvpmlenk2rurxkptlt847eh3y79";
+const char* WORKER_ID = "1FRpCfmiwAGVkCLt2FjVuuoAjhSaE2j4QN";
 const char* WORKER_PASS = "x";
 const double DEFAULT_DIFFICULTY = 0.00015;
 
@@ -270,36 +270,39 @@ bool buildBlockHeader(const String& extranonce2, uint8_t* headerOut) {
     }
     hexToBytes(headerHex, headerOut);
 
-    // Passo 3: Word-swap endian
-    // CORREÇÃO v2.0: prevhash do Stratum já é LE, NÃO precisa word-swap!
-    // version/ntime/nbits são enviados como hex do VALOR → word-swap para LE
-    // merkle root é SHA-256 output cru → não toca
-    // nonce é escrito via memcpy em LE nativo → não toca
-    #define WORD_SWAP_4(off) do { \
-        uint8_t t0 = headerOut[off], t1 = headerOut[off+1]; \
+    // Passo 3: Word-swap endian (IGUAL NerdMiner_v2 utils.cpp calculateMiningData)
+    // Todos os campos do Stratum são hexstrings big-endian dos valores.
+    // Após to_byte_array(), cada 4-byte word precisa ser invertida para LE.
+    // merkle root é SHA-256 output cru → NÃO toca.
+    // nonce é escrito via memcpy em LE nativo → NÃO toca.
+    #define WS4(off) do { \
+        uint8_t _t0 = headerOut[off], _t1 = headerOut[off+1]; \
         headerOut[off] = headerOut[off+3]; \
         headerOut[off+1] = headerOut[off+2]; \
-        headerOut[off+2] = t1; \
-        headerOut[off+3] = t0; \
+        headerOut[off+2] = _t1; \
+        headerOut[off+3] = _t0; \
     } while(0)
 
-    // version: valor hex → word-swap para LE (offset 0, 4 bytes)
-    WORD_SWAP_4(0);
+    // version (offset 0, 4 bytes)
+    WS4(0);
 
-    // prev hash: JÁ está em LE! NÃO fazer word-swap! (bug corrigido v2.0)
-    // O Stratum envia prevhash como LE hex, bytes vão direto pro header
+    // prev hash (offset 4, 32 bytes = 8 words de 4 bytes)
+    // CORREÇÃO v2.1: NerdMiner_v2 FAZ word-swap do prevhash! v2.0 removeu erradamente.
+    for (int w = 0; w < 8; w++) {
+        WS4(4 + w * 4);
+    }
 
-    // merkle root: NÃO INVERTE! SHA-256 output cru
+    // merkle root: NÃO INVERTE! SHA-256 output cru (offset 36, 32 bytes)
 
-    // ntime: valor hex → word-swap para LE (offset 68, 4 bytes)
-    WORD_SWAP_4(68);
+    // ntime (offset 68, 4 bytes)
+    WS4(68);
 
-    // nbits: valor hex → word-swap para LE (offset 72, 4 bytes)
-    WORD_SWAP_4(72);
+    // nbits (offset 72, 4 bytes)
+    WS4(72);
 
-    // nonce (offset 76): fica como "00000000", será preenchido no mining loop
+    // nonce (offset 76): "00000000" será preenchido via memcpy no loop
 
-    #undef WORD_SWAP_4
+    #undef WS4
     return true;
 }
 
@@ -349,7 +352,7 @@ void drawUI() {
         display.setCursor(0, 20); display.print("Conectando...");
     }
     else if (currentState == STATE_MINING) {
-            display.setCursor(0, 0); display.print("BTC MINER v2.0");
+            display.setCursor(0, 0); display.print("BTC MINER v2.1");
         display.drawLine(0, 10, 128, 10, WHITE);
         String statusShort = poolStatus.substring(0, 21);
         display.setCursor(0, 15); display.print(statusShort);
@@ -698,12 +701,11 @@ void miningLoop() {
         doubleSHA256(blockheader, 80, hashBe);
         localH++;
 
-        // Converte hash para LE para calcular dificuldade
-        uint8_t hashLe[32];
-        memcpy(hashLe, hashBe, 32);
-        reverseBytes(hashLe, 32);
-
-        double hashDiff = diffFromTarget(hashLe);
+        // CORREÇÃO v2.1: diff_from_target do NerdMiner_v2 recebe hash em BIG-ENDIAN!
+        // A função le256todouble() interpreta os bytes como LE internamente.
+        // NerdMiner_v2 chama diff_from_target(result->hash) onde hash está em BE.
+        // Antes (v2.0): invertíamos para LE → le256todouble lia ao contrário → diff falsa
+        double hashDiff = diffFromTarget(hashBe);
         if (hashDiff > bestDiff) {
             bestDiff = hashDiff;
             diagBestNonce = nonce;
@@ -818,7 +820,7 @@ void handleButtons() {
 
 void setup() {
     Serial.begin(115200);
-    Serial.println("\n\n=== ESP32 BTC Miner v2.0 ===");
+    Serial.println("\n\n=== ESP32 BTC Miner v2.1 ===");
 
     pinMode(BTN_UP, INPUT_PULLUP); pinMode(BTN_DOWN, INPUT_PULLUP);
     pinMode(BTN_SEL, INPUT_PULLUP); pinMode(BTN_BACK, INPUT_PULLUP);
