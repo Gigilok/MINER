@@ -36,7 +36,7 @@ const char* STRATUM_HOST = "pool.nerdminer.io";
 const int STRATUM_PORT = 3333;
 // Apenas o endereço BTC - igual ao NerdMiner_v2
 // O sufixo .esp32 impedia o painel de reconhecer o worker
-const char* WORKER_ID = "1FRpCfmiwAGVkCLt2FjVuuoAjhSaE2j4QN";
+const char* WORKER_ID = "bc1qatm8zewhemwlvpmlenk2rurxkptlt847eh3y79";
 const char* WORKER_PASS = "x";
 const double DEFAULT_DIFFICULTY = 0.00015;
 
