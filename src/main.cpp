@@ -1,12 +1,36 @@
+// ============================================================================
+// ESP32 BTC Miner v2.2 — Complete port from NerdMiner_v2
+// ============================================================================
+// TODA a lógica de mineração portada integralmente de:
+//   https://github.com/BitMaker-hub/NerdMiner_v2
+// Arquivos portados para este único .cpp:
+//   src/utils.cpp  → calculateMiningData, to_byte_array, hex,
+//                     le256todouble, diff_from_target, isSha256Valid,
+//                     checkValid, suffix_string, reverse_bytes
+//   src/stratum.cpp → tx_mining_subscribe, parse_mining_subscribe,
+//                     init_mining_subscribe, tx_mining_auth,
+//                     parse_mining_method, parse_mining_notify,
+//                     tx_mining_submit, parse_mining_set_difficulty,
+//                     tx_suggest_difficulty, parse_extract_id
+//   src/mining.h   → miner_data struct, DEFAULT_DIFFICULTY,
+//                     KEEPALIVE_TIME_ms, POOLINACTIVITY_TIME_ms,
+//                     TARGET_BUFFER_SIZE
+//   src/stratum.h   → mining_subscribe, mining_job, stratum_method,
+//                     BUFFER_JSON_DOC, BUFFER
+//   src/version.h   → CURRENT_VERSION
+// ============================================================================
+
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <WiFi.h>
+#include <WiFiClient.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <mbedtls/sha256.h>
-#include <WiFiClient.h>
+#include <string.h>
+#include <stdio.h>
 
 // --- PINOS ---
 #define OLED_SDA 21
@@ -22,30 +46,642 @@ Adafruit_SSD1306 display(128, 64, &Wire, -1);
 Preferences preferences;
 
 // --- POOL ---
-// pool.nerdminers.org REJEITA clientes que não sejam NerdMiner original!
-// pool.nerdminer.io aceita QUALQUER cliente Stratum, ajusta diff auto para ESP32
-// Dashboard: https://nerdminer.io  |  0% taxa  |  Solo mining
-// Outras opções compatíveis (descomente para trocar):
-//   pool.nerdminers.org:3333 (SÓ NerdMiner original!)
-//   pool.pyblock.xyz:3333   (curly60e)
-//   pool.sethforprivacy.com:3333
-//   pool.stompi.de:3333
-//   pool.solomining.de:3333
-//   public-pool.io:3333     (bloqueia ESP32)
 const char* STRATUM_HOST = "pool.nerdminer.io";
 const int STRATUM_PORT = 3333;
-// Apenas o endereço BTC - igual ao NerdMiner_v2
-// O sufixo .esp32 impedia o painel de reconhecer o worker
-const char* WORKER_ID = "1FRpCfmiwAGVkCLt2FjVuuoAjhSaE2j4QN";
+const char* WORKER_ID = "bc1qatm8zewhemwlvpmlenk2rurxkptlt847eh3y79";
 const char* WORKER_PASS = "x";
-const double DEFAULT_DIFFICULTY = 0.00015;
 
-// Tamanho do JSON - CRÍTICO: mining.notify pode ter >2KB
-// NerdMiner_v2 usa 4096, usamos 6144 para margem de segurança
-#define JSON_DOC_SIZE 6144
+// ============================================================================
+// PORTADO DE: src/mining.h  +  src/stratum.h  +  src/version.h
+// ============================================================================
 
-enum UI_State { STATE_SCANNING, STATE_SELECT_SSID, STATE_INPUT_PASSWORD, STATE_CONNECTING, STATE_MINING };
-UI_State currentState = STATE_SCANNING;
+#define TARGET_BUFFER_SIZE 64
+#define MAX_MERKLE_BRANCHES 32
+#define BUFFER_JSON_DOC 4096
+#define BUFFER 1024
+#define DEFAULT_DIFFICULTY  0.00015
+#define KEEPALIVE_TIME_ms       30000
+#define POOLINACTIVITY_TIME_ms  60000
+#define CURRENT_VERSION "V1.8.3"
+
+typedef struct{
+  uint8_t bytearray_target[32];
+  uint8_t bytearray_pooltarget[32];
+  uint8_t merkle_result[32];
+  uint8_t bytearray_blockheader[128];
+} miner_data;
+
+typedef struct {
+    String sub_details;
+    String extranonce1;
+    String extranonce2;
+    int extranonce2_size;
+    char wName[80];
+    char wPass[20];
+} mining_subscribe;
+
+typedef struct {
+    String job_id;
+    String prev_block_hash;
+    String coinb1;
+    String coinb2;
+    String nbits;
+    JsonArray merkle_branch;
+    String version;
+    uint32_t target;
+    String ntime;
+    bool clean_jobs;
+} mining_job;
+
+typedef enum {
+    STRATUM_SUCCESS,
+    STRATUM_UNKNOWN,
+    STRATUM_PARSE_ERROR,
+    MINING_NOTIFY,
+    MINING_SET_DIFFICULTY
+} stratum_method;
+
+// ============================================================================
+// PORTADO DE: src/utils.cpp  (funções exatas do NerdMiner_v2)
+// ============================================================================
+
+// Função hex() EXATA do NerdMiner_v2
+uint8_t hex(char ch) {
+    uint8_t r = (ch > 57) ? (ch - 55) : (ch - 48);
+    return r & 0x0F;
+}
+
+// Função to_byte_array() EXATA do NerdMiner_v2
+int to_byte_array(const char *in, size_t in_size, uint8_t *out) {
+    int count = 0;
+    if (in_size % 2) {
+        while (*in && out) {
+            *out = hex(*in++);
+            if (!*in)
+                return count;
+            *out = (*out << 4) | hex(*in++);
+            *out++;
+            count++;
+        }
+        return count;
+    } else {
+        while (*in && out) {
+            *out++ = (hex(*in++) << 4) | hex(*in++);
+            count++;
+        }
+        return count;
+    }
+}
+
+// Função reverse_bytes() EXATA do NerdMiner_v2
+void reverse_bytes(uint8_t * data, size_t len) {
+    for (int i = 0; i < len / 2; ++i) {
+        uint8_t temp = data[i];
+        data[i] = data[len - 1 - i];
+        data[len - 1 - i] = temp;
+    }
+}
+
+// le256todouble() EXATA do NerdMiner_v2
+static const double truediffone = 26959535291011309493156476344723991336010898738574164086137773096960.0;
+
+double le256todouble(const void *target) 
+{
+        const uint64_t *data64;
+        double dcut64;
+
+        data64 = (const uint64_t *)((const uint8_t*)target + 24);
+        dcut64 = *data64 * 6277101735386680763835789423207666416102355444464034512896.0;
+
+        data64 = (const uint64_t *)((const uint8_t*)target + 16);
+        dcut64 += *data64 * 340282366920938463463374607431768211456.0;
+
+        data64 = (const uint64_t *)((const uint8_t*)target + 8);
+        dcut64 += *data64 * 18446744073709551616.0;
+
+        data64 = (const uint64_t *)(target);
+        dcut64 += *data64;
+
+  return dcut64;
+}
+
+// diff_from_target() EXATA do NerdMiner_v2
+// IMPORTANTE: recebe hash em BIG-ENDIAN (ordem natural do SHA256)
+double diff_from_target(void *target)
+{
+        double d64, dcut64;
+
+        d64 = truediffone;
+        dcut64 = le256todouble(target);
+        if (unlikely(!dcut64))
+                dcut64 = 1;
+        return d64 / dcut64;
+}
+
+// isSha256Valid() EXATA do NerdMiner_v2
+bool isSha256Valid(const void* sha256)
+{
+    for(uint8_t i=0; i < 8; ++i)
+    {
+        if ( ((const uint32_t*)sha256)[i] != 0 ) 
+            return true;
+    }
+    return false;
+}
+
+// checkValid() EXATA do NerdMiner_v2
+bool checkValid(unsigned char* hash, unsigned char* target) {
+  bool valid = true;
+  unsigned char diff_target[32];
+  memcpy(diff_target, &target, 32);
+  reverse_bytes(diff_target, 32);
+
+  for(uint8_t i=31; i>=0; i--) {
+    if(hash[i] > diff_target[i]) {
+      valid = false;
+      break;
+    }
+  }
+  return valid;
+}
+
+// suffix_string() EXATA do NerdMiner_v2 (para display)
+void suffix_string(double val, char *buf, size_t bufsiz, int sigdigits)
+{
+        const double kilo = 1000;
+        const double mega = 1000000;
+        const double giga = 1000000000;
+        const double tera = 1000000000000;
+        const double peta = 1000000000000000;
+        const double exa  = 1000000000000000000;
+        const double min_diff = 0.001;
+    const byte maxNdigits = 2;
+        char suffix[2] = {0,0};
+        bool decimal = true;
+        double dval;
+
+        if (val >= exa) {
+                val /= peta;
+                dval = val / kilo;
+        suffix[0] = 'E';
+        if (dval > 999.99)
+            dval = 999.99;
+        } else if (val >= peta) {
+                val /= tera;
+                dval = val / kilo;
+                suffix[0] = 'P';
+        } else if (val >= tera) {
+                val /= giga;
+                dval = val / kilo;
+                suffix[0] = 'T';
+        } else if (val >= giga) {
+                val /= mega;
+                dval = val / kilo;
+                suffix[0] = 'G';
+        } else if (val >= mega) {
+                val /= kilo;
+                dval = val / kilo;
+                suffix[0] = 'M';
+        } else if (val >= kilo) {
+                dval = val / kilo;
+                suffix[0] = 'K';
+        } else {
+                dval = val;
+                if (dval < min_diff)
+                        dval = 0.0;
+        }
+    
+    int frac = 3;
+    if (suffix[0] != 0)
+    {
+        if (dval > 99.999)
+            frac = 1;
+        else if (dval > 9.999)
+            frac = 2;
+    } else
+    {
+        if (dval > 99.999)
+            frac = 2;
+        else if (dval > 9.999)
+            frac = 3;
+        else
+            frac = 4;
+    }
+
+        if (!sigdigits) {
+                if (decimal)
+        {
+            if (frac == 4)
+                            snprintf(buf, bufsiz, "%.4f%s", dval, suffix);
+            else if (frac == 3)
+                            snprintf(buf, bufsiz, "%.3f%s", dval, suffix);
+            else if (frac == 2)
+                            snprintf(buf, bufsiz, "%.2f%s", dval, suffix);
+            else
+                            snprintf(buf, bufsiz, "%.1f%s", dval, suffix);
+        } else
+                        snprintf(buf, bufsiz, "%d%s", (unsigned int)dval, suffix);
+        } else {
+                int ndigits = sigdigits - 1 - (dval > 0.0 ? floor(log10(dval)) : 0);
+                snprintf(buf, bufsiz, "%*.*f%s", sigdigits + 1, ndigits, dval, suffix);
+        }
+}
+
+// ============================================================================
+// calculateMiningData() — PORTADA INTEGRALMENTE de NerdMiner_v2 utils.cpp
+// Esta é a função mais crítica: constrói o block header de 80 bytes
+// ============================================================================
+
+miner_data calculateMiningData(mining_subscribe& mWorker, mining_job mJob)
+{
+  miner_data mMiner;
+  memset(&mMiner, 0, sizeof(mMiner));
+
+  // calculate target - target = (nbits[2:]+'00'*(int(nbits[:2],16) - 3)).zfill(64)
+  char target[TARGET_BUFFER_SIZE+1];
+  memset(target, '0', TARGET_BUFFER_SIZE);
+  int zeros = (int) strtol(mJob.nbits.substring(0, 2).c_str(), 0, 16) - 3;
+  memcpy(target + zeros - 2, mJob.nbits.substring(2).c_str(), mJob.nbits.length() - 2);
+  target[TARGET_BUFFER_SIZE] = 0;
+  Serial.print("    target: "); Serial.println(target);
+  
+  // bytearray target
+  size_t size_target = to_byte_array(target, 32, mMiner.bytearray_target);
+
+  // Reverse first 8 bytes of target (XOR swap, EXATO do NerdMiner_v2)
+  for (size_t j = 0; j < 8; j++) {
+    mMiner.bytearray_target[j] ^= mMiner.bytearray_target[size_target - 1 - j];
+    mMiner.bytearray_target[size_target - 1 - j] ^= mMiner.bytearray_target[j];
+    mMiner.bytearray_target[j] ^= mMiner.bytearray_target[size_target - 1 - j];
+  }
+
+  // get extranonce2 - EXATO do NerdMiner_v2
+  if (mWorker.extranonce2_size == 2)
+      mWorker.extranonce2 = "0001";
+  else if (mWorker.extranonce2_size == 4)
+      mWorker.extranonce2 = "00000001";
+  else if (mWorker.extranonce2_size == 8)
+      mWorker.extranonce2 = "0000000000000001";
+  else
+  {
+      Serial.println("Unknown extranonce2");
+      mWorker.extranonce2 = "00000001";
+  }
+  
+  // get coinbase - EXATO do NerdMiner_v2
+  static char coinbase_buffer[512];
+  snprintf(coinbase_buffer, sizeof(coinbase_buffer), "%s%s%s%s", 
+           mJob.coinb1.c_str(), mWorker.extranonce1.c_str(), 
+           mWorker.extranonce2.c_str(), mJob.coinb2.c_str());
+  Serial.print("    coinbase: "); Serial.println(coinbase_buffer);
+  size_t str_len = strlen(coinbase_buffer)/2;
+  uint8_t bytearray[256];
+  size_t res = to_byte_array(coinbase_buffer, str_len*2, bytearray);
+
+  // Double SHA256 do coinbase - EXATO do NerdMiner_v2
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  byte interResult[32];
+  byte shaResult[32];
+
+  mbedtls_sha256_starts_ret(&ctx,0);
+  mbedtls_sha256_update_ret(&ctx, bytearray, str_len);
+  mbedtls_sha256_finish_ret(&ctx, interResult);
+
+  mbedtls_sha256_starts_ret(&ctx,0);
+  mbedtls_sha256_update_ret(&ctx, interResult, 32);
+  mbedtls_sha256_finish_ret(&ctx, shaResult);
+  mbedtls_sha256_free(&ctx);
+
+  // copy coinbase hash
+  memcpy(mMiner.merkle_result, shaResult, sizeof(shaResult));
+  
+  // Merkle tree - EXATO do NerdMiner_v2
+  byte merkle_concatenated[32 * 2];
+  for (size_t k=0; k < mJob.merkle_branch.size(); k++) {
+      const char* merkle_element = (const char*) mJob.merkle_branch[k];
+      uint8_t bytearray_m[32];
+      size_t res_m = to_byte_array(merkle_element, 64, bytearray_m);
+
+      for (size_t i = 0; i < 32; i++) {
+        merkle_concatenated[i] = mMiner.merkle_result[i];
+        merkle_concatenated[32 + i] = bytearray_m[i];
+      }
+
+      mbedtls_sha256_context ctx2;
+      mbedtls_sha256_init(&ctx2);
+      mbedtls_sha256_starts_ret(&ctx2,0);
+      mbedtls_sha256_update_ret(&ctx2, merkle_concatenated, 64);
+      mbedtls_sha256_finish_ret(&ctx2, interResult);
+
+      mbedtls_sha256_starts_ret(&ctx2,0);
+      mbedtls_sha256_update_ret(&ctx2, interResult, 32);
+      mbedtls_sha256_finish_ret(&ctx2, mMiner.merkle_result);
+      mbedtls_sha256_free(&ctx2);
+  }
+  
+  // merkle root
+  Serial.print("    merkle sha         : ");
+  char merkle_root[65];
+  for (int i = 0; i < 32; i++) {
+    Serial.printf("%02x", mMiner.merkle_result[i]);
+    snprintf(&merkle_root[i*2], 3, "%02x", mMiner.merkle_result[i]);
+  }
+  merkle_root[65] = 0;
+  Serial.println("");
+
+  // calculate blockheader - EXATO do NerdMiner_v2
+  // j.block_header = ''.join([j.version, j.prevhash, merkle_root, j.ntime, j.nbits])
+  String blockheader = mJob.version + mJob.prev_block_hash + String(merkle_root) + mJob.ntime + mJob.nbits + "00000000";
+  str_len = blockheader.length()/2;
+  
+  res = to_byte_array(blockheader.c_str(), str_len*2, mMiner.bytearray_blockheader);
+
+  // === ENDIAN SWAPS — EXATOS do NerdMiner_v2 calculateMiningData ===
+  uint8_t buff;
+  size_t bword, bsize, boffset;
+
+  // reverse version (4 bytes, word-swap)
+  boffset = 0;
+  bsize = 4;
+  for (size_t j = boffset; j < boffset + (bsize/2); j++) {
+      buff = mMiner.bytearray_blockheader[j];
+      mMiner.bytearray_blockheader[j] = mMiner.bytearray_blockheader[2 * boffset + bsize - 1 - j];
+      mMiner.bytearray_blockheader[2 * boffset + bsize - 1 - j] = buff;
+  }
+
+  // reverse prev hash (4-byte word swap) — EXATO do NerdMiner_v2
+  boffset = 4;
+  bword = 4;
+  bsize = 32;
+  for (size_t i = 1; i <= bsize / bword; i++) {
+      for (size_t j = boffset; j < boffset + bword / 2; j++) {
+          buff = mMiner.bytearray_blockheader[j];
+          mMiner.bytearray_blockheader[j] = mMiner.bytearray_blockheader[2 * boffset + bword - 1 - j];
+          mMiner.bytearray_blockheader[2 * boffset + bword - 1 - j] = buff;
+      }
+      boffset += bword;
+  }
+
+  // merkle root: NÃO INVERTE! (comentado no NerdMiner_v2)
+
+  // reverse ntime (4 bytes, word-swap)
+  boffset = 68;
+  bsize = 4;
+  for (size_t j = boffset; j < boffset + (bsize/2); j++) {
+      buff = mMiner.bytearray_blockheader[j];
+      mMiner.bytearray_blockheader[j] = mMiner.bytearray_blockheader[2 * boffset + bsize - 1 - j];
+      mMiner.bytearray_blockheader[2 * boffset + bsize - 1 - j] = buff;
+  }
+
+  // reverse difficulty/nbits (4 bytes, word-swap)
+  boffset = 72;
+  bsize = 4;
+  for (size_t j = boffset; j < boffset + (bsize/2); j++) {
+      buff = mMiner.bytearray_blockheader[j];
+      mMiner.bytearray_blockheader[j] = mMiner.bytearray_blockheader[2 * boffset + bsize - 1 - j];
+      mMiner.bytearray_blockheader[2 * boffset + bsize - 1 - j] = buff;
+  }
+
+  // Debug: dump blockheader
+  Serial.print("    blockheader hex: "); 
+  for (size_t i = 0; i < 80; i++)
+      Serial.printf("%02x", mMiner.bytearray_blockheader[i]);
+  Serial.println("");
+
+  return mMiner;
+}
+
+// ============================================================================
+// PORTADO DE: src/stratum.cpp  (funções EXATAS do NerdMiner_v2)
+// ============================================================================
+
+StaticJsonDocument<BUFFER_JSON_DOC> g_doc;  // Global para evitar stack overflow
+unsigned long g_stratum_id = 1;  // ID global para mensagens Stratum
+
+// Forward declarations
+unsigned long getNextId(unsigned long id);
+bool verifyPayload (String* line);
+bool checkError(const StaticJsonDocument<BUFFER_JSON_DOC> doc);
+mining_subscribe init_mining_subscribe(void);
+bool tx_mining_subscribe(WiFiClient& client, mining_subscribe& mSubscribe);
+bool parse_mining_subscribe(String line, mining_subscribe& mSubscribe);
+bool tx_mining_auth(WiFiClient& client, const char * user, const char * pass);
+stratum_method parse_mining_method(String line);
+bool parse_mining_notify(String line, mining_job& mJob);
+bool tx_mining_submit(WiFiClient& client, mining_subscribe mWorker, mining_job mJob, unsigned long nonce, unsigned long &submit_id);
+bool parse_mining_set_difficulty(String line, double& difficulty);
+bool tx_suggest_difficulty(WiFiClient& client, double difficulty);
+unsigned long parse_extract_id(const String &line);
+
+unsigned long getNextId(unsigned long id) {
+    if (id == ULONG_MAX) {
+      id = 1;
+      return id;
+    }
+    return ++id;
+}
+
+bool verifyPayload (String* line){
+  if(line->length() == 0) return false;
+  line->trim();
+  if(line->isEmpty()) return false;
+  return true;
+}
+
+bool checkError(const StaticJsonDocument<BUFFER_JSON_DOC> doc) {
+  if (!doc.containsKey("error")) return false;
+  if (doc["error"].size() == 0) return false;
+  Serial.printf("ERROR: %d | reason: %s \n", (const int) doc["error"][0], (const char*) doc["error"][1]);
+  return true;  
+}
+
+mining_subscribe init_mining_subscribe(void)
+{
+    mining_subscribe new_mSub;
+    new_mSub.extranonce1 = "";
+    new_mSub.extranonce2 = "";
+    new_mSub.extranonce2_size = 0;
+    new_mSub.sub_details = "";
+    return new_mSub;
+}
+
+// STEP 1: mining.subscribe — EXATO do NerdMiner_v2
+bool tx_mining_subscribe(WiFiClient& client, mining_subscribe& mSubscribe)
+{
+    char payload[BUFFER] = {0};
+    g_stratum_id = 1;
+    sprintf(payload, "{\"id\": %u, \"method\": \"mining.subscribe\", \"params\": [\"NerdMinerV2/%s\"]}\n", g_stratum_id, CURRENT_VERSION);
+    
+    Serial.printf("[WORKER] ==> Mining subscribe\n");
+    Serial.print("  Sending  : "); Serial.println(payload);
+    client.print(payload);
+    
+    delay(200);
+    
+    String line = client.readStringUntil('\n');
+    if(!parse_mining_subscribe(line, mSubscribe)) return false;
+
+    Serial.print("    sub_details: "); Serial.println(mSubscribe.sub_details);
+    Serial.print("    extranonce1: "); Serial.println(mSubscribe.extranonce1);
+    Serial.print("    extranonce2_size: "); Serial.println(mSubscribe.extranonce2_size);
+
+    if((mSubscribe.extranonce1.length() == 0) ) { 
+        Serial.printf("[WORKER] >>>>>>>>> Work aborted\n"); 
+        Serial.printf("extranonce1 length: %u \n", mSubscribe.extranonce1.length());
+        g_doc.clear();
+        g_doc.garbageCollect();
+        return false; 
+    }
+    return true;
+}
+
+bool parse_mining_subscribe(String line, mining_subscribe& mSubscribe)
+{
+    if(!verifyPayload(&line)) return false;
+    Serial.print("  Receiving: "); Serial.println(line);
+   
+    DeserializationError error = deserializeJson(g_doc, line);
+    if (error || checkError(g_doc)) return false;
+    if (!g_doc.containsKey("result")) return false;
+
+    mSubscribe.sub_details = String((const char*) g_doc["result"][0][0][1]);
+    mSubscribe.extranonce1 = String((const char*) g_doc["result"][1]);
+    mSubscribe.extranonce2_size = g_doc["result"][2];
+    return true;
+}
+
+// STEP 2: mining.authorize — EXATO do NerdMiner_v2
+bool tx_mining_auth(WiFiClient& client, const char * user, const char * pass)
+{
+    char payload[BUFFER] = {0};
+    g_stratum_id = getNextId(g_stratum_id);
+    sprintf(payload, "{\"params\": [\"%s\", \"%s\"], \"id\": %u, \"method\": \"mining.authorize\"}\n", 
+      user, pass, g_stratum_id);
+    
+    Serial.printf("[WORKER] ==> Authorize work\n");
+    Serial.print("  Sending  : "); Serial.println(payload);
+    client.print(payload);
+    delay(200);
+    return true;
+}
+
+// parse_mining_method — EXATO do NerdMiner_v2
+stratum_method parse_mining_method(String line)
+{
+    if(!verifyPayload(&line)) return STRATUM_PARSE_ERROR;
+    Serial.print("  Receiving: "); Serial.println(line);
+    
+    DeserializationError error = deserializeJson(g_doc, line);
+    if (error || checkError(g_doc)) return STRATUM_PARSE_ERROR;
+
+    if (!g_doc.containsKey("method")) {
+        if (g_doc["error"].isNull())
+            return STRATUM_SUCCESS;
+        else
+            return STRATUM_UNKNOWN;
+    }
+    stratum_method result = STRATUM_UNKNOWN;
+    if (strcmp("mining.notify", (const char*) g_doc["method"]) == 0)
+        result = MINING_NOTIFY;
+    else if (strcmp("mining.set_difficulty", (const char*) g_doc["method"]) == 0)
+        result = MINING_SET_DIFFICULTY;
+    return result;
+}
+
+// parse_mining_notify — EXATO do NerdMiner_v2
+bool parse_mining_notify(String line, mining_job& mJob)
+{
+    Serial.println("    Parsing Method [MINING NOTIFY]");
+    if(!verifyPayload(&line)) return false;
+   
+    DeserializationError error = deserializeJson(g_doc, line);
+    if (error) return false;
+    if (!g_doc.containsKey("params")) return false;
+
+    mJob.job_id = String((const char*) g_doc["params"][0]);
+    mJob.prev_block_hash = String((const char*) g_doc["params"][1]);
+    mJob.coinb1 = String((const char*) g_doc["params"][2]);
+    mJob.coinb2 = String((const char*) g_doc["params"][3]);
+    mJob.merkle_branch = g_doc["params"][4];
+    mJob.version = String((const char*) g_doc["params"][5]);
+    mJob.nbits = String((const char*) g_doc["params"][6]);
+    mJob.ntime = String((const char*) g_doc["params"][7]);
+    mJob.clean_jobs = g_doc["params"][8];
+
+    if (checkError(g_doc)) {
+      Serial.printf("[WORKER] >>>>>>>>> Work aborted\n"); 
+      return false;
+    }
+    return true;
+}
+
+// STEP 3: mining.submit — EXATO do NerdMiner_v2
+bool tx_mining_submit(WiFiClient& client, mining_subscribe mWorker, mining_job mJob, unsigned long nonce, unsigned long &submit_id)
+{
+    char payload[BUFFER] = {0};
+    g_stratum_id = getNextId(g_stratum_id);
+    submit_id = g_stratum_id;
+    sprintf(payload, "{\"id\":%u,\"method\":\"mining.submit\",\"params\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}\n",
+        g_stratum_id,
+        mWorker.wName,
+        mJob.job_id.c_str(),
+        mWorker.extranonce2.c_str(),
+        mJob.ntime.c_str(),
+        String(nonce, HEX).c_str()
+        );
+    Serial.print("  Sending  : "); Serial.print(payload);
+    client.print(payload);
+    return true;
+}
+
+// parse_mining_set_difficulty — EXATO do NerdMiner_v2
+bool parse_mining_set_difficulty(String line, double& difficulty)
+{
+    Serial.println("    Parsing Method [SET DIFFICULTY]");
+    if(!verifyPayload(&line)) return false;
+   
+    DeserializationError error = deserializeJson(g_doc, line);
+    if (error) return false;
+    if (!g_doc.containsKey("params")) return false;
+
+    Serial.print("    difficulty: "); Serial.println((double)g_doc["params"][0],12);
+    difficulty = (double)g_doc["params"][0];
+    return true;
+}
+
+// tx_suggest_difficulty — EXATO do NerdMiner_v2
+bool tx_suggest_difficulty(WiFiClient& client, double difficulty)
+{
+    char payload[BUFFER] = {0};
+    g_stratum_id = getNextId(g_stratum_id);
+    sprintf(payload, "{\"id\":%d,\"method\":\"mining.suggest_difficulty\",\"params\":[%.10g]}\n", g_stratum_id, difficulty);
+    Serial.print("  Sending  : "); Serial.print(payload);
+    return client.print(payload);
+}
+
+// parse_extract_id — EXATO do NerdMiner_v2
+unsigned long parse_extract_id(const String &line)
+{
+    DeserializationError error = deserializeJson(g_doc, line);
+    if (error) return 0;
+    if (!g_doc.containsKey("id")) return 0;
+    return (unsigned long)g_doc["id"];
+}
+
+// ============================================================================
+// SHA256 (nosso — mbedtls, equivalente ao software path do NerdMiner_v2)
+// ============================================================================
+
+void doubleSHA256(const uint8_t* data, size_t len, uint8_t* out) {
+    uint8_t hash1[32];
+    mbedtls_sha256(data, len, hash1, 0);  // 0 = SHA256 (not SHA224)
+    mbedtls_sha256(hash1, 32, out, 0);
+}
+
+// ============================================================================
+// VARIÁVEIS GLOBAIS DO NOSSO FIRMWARE (UI, WiFi, estatísticas)
+// ============================================================================
 
 String ssid = "";
 String password = "";
@@ -59,8 +695,6 @@ double hashrate = 0.0;
 double bestDiff = 0.0;
 unsigned long lastHashTime = 0;
 unsigned long hashesInWindow = 0;
-
-// Contador local de shares (diff >= 0.001)
 unsigned long localShares = 0;
 
 char chars[] = " abcdefghijklmnopqrstuvwxyz0123456789@!#$%&*";
@@ -68,45 +702,33 @@ int charIndex = 0;
 int scanNetworksCount = 0;
 int selectedNetworkIndex = 0;
 
-// --- VARIÁVEIS STRATUM ---
+// --- State machine ---
+enum UI_State { STATE_SCANNING, STATE_SELECT_SSID, STATE_INPUT_PASSWORD, STATE_CONNECTING, STATE_MINING };
+UI_State currentState = STATE_SCANNING;
+
+// --- Mining state (usa structs do NerdMiner_v2) ---
+mining_subscribe mWorker;
+mining_job mJob;
+miner_data mMiner;
 double currentPoolDifficulty = DEFAULT_DIFFICULTY;
-String extranonce1 = "";
-int extranonce2_size = 4;
-String current_job_id = "";
-String current_prevhash = "";
-String current_coinb1 = "";
-String current_coinb2 = "";
-String merkle_branches[16];
-int num_branches = 0;
-String current_version_hex = "";
-String current_nbits_hex = "";
-String current_ntime_hex = "";
 bool isSubscribed = false;
 bool isAuthorized = false;
-bool isConnected = false;
+bool hasJob = false;
+unsigned long lastPoolDataTime = 0;
+unsigned long lastSuggestTime = 0;
+unsigned long lastJobTime = 0;
+bool firstHeaderLog = true;
 
-unsigned long extranonce2_val = 1;
-int stratumMsgId = 4;  // Próximo ID disponível (1=subscribe, 2=auth, 3=suggest)
-bool firstMiningLog = true;
-
-// Controle de IDs de submit para não confundir com keepalive
-#define MAX_SUBMIT_IDS 16
+// Submit tracking (para não confundir resposta de submit com keepalive)
+#define MAX_SUBMIT_IDS 32
 unsigned long submitIdList[MAX_SUBMIT_IDS];
 int submitIdCount = 0;
-unsigned long sharesSubmitted = 0;  // Total de shares enviados (não confundir com Ok/Rj)
-
-// Diagnóstico: rastreia melhor share para submit forçado
-uint32_t diagBestNonce = 0;
-String diagBestEn2 = "";
-double diagBestDiff = 0.0;
-unsigned long lastDiagTime = 0;
-int diagSubmitCount = 0;
+int sharesSubmitted = 0;
 
 void trackSubmitId(unsigned long id) {
     submitIdList[submitIdCount % MAX_SUBMIT_IDS] = id;
     submitIdCount++;
 }
-
 bool isRealSubmitId(unsigned long id) {
     int check = submitIdCount < MAX_SUBMIT_IDS ? submitIdCount : MAX_SUBMIT_IDS;
     for (int i = 0; i < check; i++) {
@@ -115,202 +737,25 @@ bool isRealSubmitId(unsigned long id) {
     return false;
 }
 
-// JSON doc GLOBAL (não na pilha!) - mining.notify pode ter >2KB
-// NerdMiner_v2 também usa doc global por este mesmo motivo
-StaticJsonDocument<JSON_DOC_SIZE> g_doc;
-
-// Timers
-unsigned long lastSuggestTime = 0;
-unsigned long lastJobTime = 0;
-unsigned long lastPoolDataTime = 0;
-#define KEEPALIVE_MS 30000
-#define POOL_INACTIVITY_MS 120000
-
-// --- BUZINA ---
+// ============================================================================
+// BUZZER
+// ============================================================================
 void buzzerInit() { pinMode(BUZZER, INPUT); }
-void beep(int durationMs = 50) {
+void beep(int ms = 50) {
     pinMode(BUZZER, OUTPUT);
-    int cycles = durationMs * 2;
-    for (int i = 0; i < cycles; i++) {
+    for (int i = 0; i < ms * 2; i++) {
         digitalWrite(BUZZER, HIGH); delayMicroseconds(250);
         digitalWrite(BUZZER, LOW); delayMicroseconds(250);
     }
     pinMode(BUZZER, INPUT);
 }
-void buzzerAlertSuccess() { beep(300); delay(150); beep(300); delay(150); beep(300); }
+void buzzerSuccess() { beep(300); delay(150); beep(300); delay(150); beep(300); }
 
-// ============================================================
-// HEX / BYTE UTILITIES
-// ============================================================
-
-uint8_t hexCharToVal(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return 0;
-}
-
-void hexToBytes(const String& hex, uint8_t* bytes) {
-    int len = hex.length() / 2;
-    for (int i = 0; i < len; i++) {
-        uint8_t high = hexCharToVal(hex.charAt(i * 2));
-        uint8_t low  = hexCharToVal(hex.charAt(i * 2 + 1));
-        bytes[i] = (high << 4) | low;
-    }
-}
-
-void reverseBytes(uint8_t* data, int len) {
-    for (int i = 0; i < len / 2; i++) {
-        uint8_t tmp = data[i];
-        data[i] = data[len - 1 - i];
-        data[len - 1 - i] = tmp;
-    }
-}
-
-String reverseHex(const String& hex) {
-    String reversed = "";
-    for (int i = hex.length() - 2; i >= 0; i -= 2) {
-        reversed += hex.substring(i, i + 2);
-    }
-    return reversed;
-}
-
-// ============================================================
-// SHA256
-// ============================================================
-
-void doubleSHA256(const uint8_t* data, size_t len, uint8_t* out) {
-    uint8_t hash1[32];
-    mbedtls_sha256(data, len, hash1, 0);
-    mbedtls_sha256(hash1, 32, out, 0);
-}
-
-// ============================================================
-// DIFFICULTY / TARGET
-// ============================================================
-
-static const double truediffone = 26959535291011309493156476344723991336010898738574164086137773096960.0;
-
-double le256todouble(const uint8_t* target) {
-    double dcut64 = 0.0;
-    const uint64_t* d64;
-    d64 = (const uint64_t*)(target + 24);
-    dcut64  = (double)(*d64) * 6277101735386680763835789423207666416102355444464034512896.0;
-    d64 = (const uint64_t*)(target + 16);
-    dcut64 += (double)(*d64) * 340282366920938463463374607431768211456.0;
-    d64 = (const uint64_t*)(target + 8);
-    dcut64 += (double)(*d64) * 18446744073709551616.0;
-    d64 = (const uint64_t*)(target);
-    dcut64 += (double)(*d64);
-    return dcut64;
-}
-
-double diffFromTarget(const uint8_t* hashLe) {
-    double d = le256todouble(hashLe);
-    if (d == 0.0) d = 1.0;
-    return truediffone / d;
-}
-
-String formatExtranonce2(unsigned long val, int size) {
-    String hex = String(val, HEX);
-    int neededChars = size * 2;
-    while (hex.length() < neededChars) hex = "0" + hex;
-    if (hex.length() > neededChars) hex = hex.substring(hex.length() - neededChars);
-    return hex;
-}
-
-// ============================================================
-// CONSTRUIR BLOCK HEADER (80 bytes)
-// ============================================================
-// Layout: version(4) + prevhash(32) + merkle_root(32) + ntime(4) + nbits(4) + nonce(4)
-
-bool buildBlockHeader(const String& extranonce2, uint8_t* headerOut) {
-    // Monta coinbase: coinb1 + extranonce1 + extranonce2 + coinb2
-    String coinbaseHex = current_coinb1 + extranonce1 + extranonce2 + current_coinb2;
-    int cbLen = coinbaseHex.length() / 2;
-    if (cbLen <= 0 || cbLen > 256) {
-        Serial.printf("[ERROR] Coinbase invalido: len=%d\n", cbLen);
-        return false;
-    }
-
-    uint8_t coinbaseBytes[256];
-    hexToBytes(coinbaseHex, coinbaseBytes);
-
-    // Calcula merkle root (igual NerdMiner_v2: double SHA256)
-    uint8_t merkleRoot[32];
-    doubleSHA256(coinbaseBytes, cbLen, merkleRoot);
-
-    uint8_t buf[64];
-    for (int i = 0; i < num_branches; i++) {
-        if (merkle_branches[i].length() < 64) continue;
-        uint8_t branchBytes[32];
-        hexToBytes(merkle_branches[i], branchBytes);
-        memcpy(buf, merkleRoot, 32);
-        memcpy(buf + 32, branchBytes, 32);
-        doubleSHA256(buf, 64, merkleRoot);
-    }
-
-    // === CONSTRUIR HEADER IDÊNTICO AO NerdMiner_v2 ===
-    // Passo 1: Monta string hex do header (tudo em ordem BE/original)
-    // merkle_root fica em BE (ordem natural do SHA256) - NÃO inverte!
-    String merkleHex = "";
-    for (int i = 0; i < 32; i++) {
-        if (merkleRoot[i] < 0x10) merkleHex += "0";
-        merkleHex += String(merkleRoot[i], HEX);
-    }
-    // Ordem: version + prevhash + merkle + ntime + nbits + nonce(00000000)
-    String headerHex = current_version_hex + current_prevhash + merkleHex +
-                       current_ntime_hex + current_nbits_hex + "00000000";
-
-    // Passo 2: Converte hex para bytes
-    int headerLen = headerHex.length() / 2;
-    if (headerLen != 80) {
-        Serial.printf("[ERROR] Header len=%d (deveria ser 80)\n", headerLen);
-        return false;
-    }
-    hexToBytes(headerHex, headerOut);
-
-    // Passo 3: Word-swap endian (IGUAL NerdMiner_v2 utils.cpp calculateMiningData)
-    // Todos os campos do Stratum são hexstrings big-endian dos valores.
-    // Após to_byte_array(), cada 4-byte word precisa ser invertida para LE.
-    // merkle root é SHA-256 output cru → NÃO toca.
-    // nonce é escrito via memcpy em LE nativo → NÃO toca.
-    #define WS4(off) do { \
-        uint8_t _t0 = headerOut[off], _t1 = headerOut[off+1]; \
-        headerOut[off] = headerOut[off+3]; \
-        headerOut[off+1] = headerOut[off+2]; \
-        headerOut[off+2] = _t1; \
-        headerOut[off+3] = _t0; \
-    } while(0)
-
-    // version (offset 0, 4 bytes)
-    WS4(0);
-
-    // prev hash (offset 4, 32 bytes = 8 words de 4 bytes)
-    // CORREÇÃO v2.1: NerdMiner_v2 FAZ word-swap do prevhash! v2.0 removeu erradamente.
-    for (int w = 0; w < 8; w++) {
-        WS4(4 + w * 4);
-    }
-
-    // merkle root: NÃO INVERTE! SHA-256 output cru (offset 36, 32 bytes)
-
-    // ntime (offset 68, 4 bytes)
-    WS4(68);
-
-    // nbits (offset 72, 4 bytes)
-    WS4(72);
-
-    // nonce (offset 76): "00000000" será preenchido via memcpy no loop
-
-    #undef WS4
-    return true;
-}
-
-// ============================================================
+// ============================================================================
 // TELA OLED
-// ============================================================
+// ============================================================================
 
-void drawSplashScreen() {
+void drawSplash() {
     display.clearDisplay();
     display.setTextSize(3); display.setTextColor(WHITE);
     display.setCursor(15, 15); display.print("MINER");
@@ -320,9 +765,9 @@ void drawSplashScreen() {
 void drawUI() {
     display.clearDisplay();
     int batRaw = analogRead(BAT_ADC);
-    int batPercent = map(batRaw, 0, 4095, 0, 100);
+    int batPct = map(batRaw, 0, 4095, 0, 100);
     display.setTextSize(1); display.setTextColor(WHITE);
-    display.setCursor(85, 0); display.print("B:"); display.print(batPercent); display.print("%");
+    display.setCursor(85, 0); display.print("B:"); display.print(batPct); display.print("%");
 
     if (currentState == STATE_SCANNING) {
         display.setCursor(0, 0); display.print("Procurando Wi-Fi...");
@@ -344,7 +789,7 @@ void drawUI() {
         display.drawLine(0, 10, 128, 10, WHITE);
         display.setCursor(0, 15); display.print("Senha: ");
         for (int i = 0; i < password.length(); i++) display.print("*");
-        display.setCursor(0, 30); display.print("> Char: "); display.print(chars[charIndex]);
+        display.setCursor(0, 30); display.print("> "); display.print(chars[charIndex]);
         display.setCursor(0, 45); display.print("SEL:Add BCK:Del");
         display.setCursor(0, 55); display.print("UP+DOWN: Conectar");
     }
@@ -352,211 +797,46 @@ void drawUI() {
         display.setCursor(0, 20); display.print("Conectando...");
     }
     else if (currentState == STATE_MINING) {
-            display.setCursor(0, 0); display.print("BTC MINER v2.1");
+        display.setCursor(0, 0); display.print("BTC MINER v2.2");
         display.drawLine(0, 10, 128, 10, WHITE);
-        String statusShort = poolStatus.substring(0, 21);
-        display.setCursor(0, 15); display.print(statusShort);
-        // Hashrate
+        display.setCursor(0, 15); display.print(poolStatus.substring(0, 21));
         display.setCursor(0, 25); display.print("H/s:");
-        if (hashrate >= 1000.0) {
-            display.print(hashrate / 1000.0, 1); display.print("k");
-        } else {
-            display.print((unsigned long)hashrate);
-        }
+        if (hashrate >= 1000.0) { display.print(hashrate / 1000.0, 1); display.print("k"); }
+        else display.print((unsigned long)hashrate);
         display.setCursor(64, 25); display.print("Loc:"); display.print(localShares);
-        // Hashes
         display.setCursor(0, 35); display.print("Hashes:"); display.print(hashesTotal / 1000); display.print("k");
-        // Shares aceitos/rejeitados
         display.setCursor(0, 45);
         display.print("Ok:"); display.print(acceptedShares);
         display.print(" Rj:"); display.print(rejectedShares);
         display.print(" S:"); display.print(sharesSubmitted);
-        // Dificuldade e best diff - mais casas decimais
         display.setCursor(0, 55);
         display.print("pD:");
-        if (currentPoolDifficulty < 0.01) {
-            display.print(currentPoolDifficulty, 4);
-        } else {
-            display.print(currentPoolDifficulty, 1);
-        }
+        if (currentPoolDifficulty < 0.01) display.print(currentPoolDifficulty, 4);
+        else display.print(currentPoolDifficulty, 1);
         display.print(" b:");
-        if (bestDiff < 0.01) {
-            display.print(bestDiff, 4);
-        } else {
-            display.print(bestDiff, 1);
-        }
+        if (bestDiff < 0.01) display.print(bestDiff, 4);
+        else display.print(bestDiff, 1);
     }
     display.display();
 }
 
-// ============================================================
-// STRATUM PROTOCOL
-// ============================================================
-
-void submitShare(uint32_t nonce, const String& extranonce2, bool isDiag = false) {
-    // Formata nonce como hex (igual ao NerdMiner_v2: SEM padding)
-    String nonceHex = String(nonce, HEX);
-    unsigned long thisId = stratumMsgId++;
-    trackSubmitId(thisId);  // Registra como submit REAL
-    sharesSubmitted++;
-    if (isDiag) diagSubmitCount++;
-
-    String payload = "{\"id\":" + String(thisId) +
-        ",\"method\":\"mining.submit\",\"params\":[\"" +
-        String(WORKER_ID) + "\",\"" +
-        current_job_id + "\",\"" +
-        extranonce2 + "\",\"" +
-        current_ntime_hex + "\",\"" +
-        nonceHex + "\"]}\n";
-    client.print(payload);
-    lastPoolDataTime = millis();
-    if (isDiag) {
-        Serial.printf("[DIAG] #%d id=%lu diff=%.6f nonce=%08x job=%s en2=%s\n",
-            diagSubmitCount, thisId, diagBestDiff, nonce,
-            current_job_id.c_str(), extranonce2.c_str());
-        Serial.printf("[DIAG] JSON enviado: %s", payload.c_str());
-    } else {
-        Serial.printf("[SHARE] Submitted id=%lu nonce=%08x job=%s en2=%s\n",
-            thisId, nonce, current_job_id.c_str(), extranonce2.c_str());
-    }
-}
-
-void suggestDifficulty(double diff) {
-    char buf[128];
-    // NÃO usa stratumMsgId para não conflitar com IDs de submit
-    // Usa sempre id=3 como NerdMiner_v2 (resposta é ignorada)
-    snprintf(buf, sizeof(buf), "{\"id\":3,\"method\":\"mining.suggest_difficulty\",\"params\":[%.10g]}\n", diff);
-    client.print(buf);
-    lastPoolDataTime = millis();
-}
-
-void processStratum(String line) {
-    if (line.length() < 2) return;
-
-    // Usa doc global para evitar stack overflow
-    g_doc.clear();
-    DeserializationError error = deserializeJson(g_doc, line);
-    if (error) {
-        Serial.printf("[JSON ERRO] len=%d err=%s\n", line.length(), error.c_str());
-        return;
-    }
-
-    lastPoolDataTime = millis();
-
-    // --- Resposta ao mining.subscribe (id=1) ---
-    if (g_doc.containsKey("id")) {
-        int id = g_doc["id"].as<int>();
-
-        if (id == 1 && !isSubscribed) {
-            if (g_doc["result"].is<JsonArray>()) {
-                JsonArray arr = g_doc["result"].as<JsonArray>();
-                extranonce1 = arr[1].as<String>();
-                extranonce2_size = arr[2].as<int>();
-                if (extranonce2_size <= 0) extranonce2_size = 4;
-                extranonce2_val = 1;
-                isSubscribed = true;
-                Serial.printf("[STRATUM] Subscribed OK! en1=%s size=%d\n", extranonce1.c_str(), extranonce2_size);
-            }
-        }
-        // Resposta ao mining.authorize (id=2)
-        else if (id == 2 && !isAuthorized) {
-            if (g_doc["result"] == true) {
-                isAuthorized = true;
-                poolStatus = "Logado! Minerando...";
-                Serial.println("[STRATUM] Authorized OK!");
-            } else if (g_doc.containsKey("error") && !g_doc["error"].isNull()) {
-                poolStatus = "ERRO: Login!";
-                Serial.print("[STRATUM] Auth FAILED: ");
-                serializeJson(g_doc["error"], Serial);
-                Serial.println();
-            }
-        }
-        // Resposta ao mining.suggest_difficulty (id=3) - ignorar (não é share)
-        else if (id == 3) {
-            // Resposta do suggest_difficulty - ignorar silenciosamente
-        }
-        // Respostas ao mining.submit (id >= 4) - VERIFICAR se é submit REAL
-        else if (id >= 4) {
-            // CRÍTICO: só processar se este ID foi usado num submit real
-            if (!isRealSubmitId(id)) {
-                return;
-            }
-            // Loga a RESPOSTA COMPLETA do pool para diagnóstico
-            Serial.print("[POOL RESP] id="); Serial.print(id); Serial.print(" ");
-            serializeJson(g_doc, Serial);
-            Serial.println();
-
-            if (g_doc["result"] == true) {
-                acceptedShares++;
-                Serial.println("[SHARE] *** ACCEPTED! ***");
-                buzzerAlertSuccess();
-            } else {
-                rejectedShares++;
-                Serial.print("[SHARE] REJECTED: ");
-                if (g_doc.containsKey("error")) serializeJson(g_doc["error"], Serial);
-                Serial.println();
-            }
-        }
-    }
-
-    // --- Notificações do pool (method) ---
-    if (g_doc.containsKey("method")) {
-        const char* method = g_doc["method"];
-
-        if (strcmp(method, "mining.set_difficulty") == 0) {
-            double newDiff = g_doc["params"][0].as<double>();
-            currentPoolDifficulty = newDiff;
-            Serial.printf("[STRATUM] *** Pool set diff: %.6f ***\n", newDiff);
-        }
-
-        if (strcmp(method, "mining.notify") == 0) {
-            String newJobId = g_doc["params"][0].as<String>();
-            current_prevhash = g_doc["params"][1].as<String>();
-            current_coinb1 = g_doc["params"][2].as<String>();
-            current_coinb2 = g_doc["params"][3].as<String>();
-
-            num_branches = 0;
-            JsonArray branches = g_doc["params"][4];
-            for (int i = 0; i < 16 && i < branches.size(); i++) {
-                if (!branches[i].isNull())
-                    merkle_branches[num_branches++] = branches[i].as<String>();
-            }
-
-            current_version_hex = g_doc["params"][5].as<String>();
-            current_nbits_hex = g_doc["params"][6].as<String>();
-            current_ntime_hex = g_doc["params"][7].as<String>();
-
-            current_job_id = newJobId;
-            extranonce2_val = 1;
-            lastJobTime = millis();
-
-            Serial.printf("[JOB] job=%s prev=%s... nbits=%s ntime=%s branches=%d\n",
-                current_job_id.c_str(),
-                current_prevhash.substring(0, 16).c_str(),
-                current_nbits_hex.c_str(),
-                current_ntime_hex.c_str(),
-                num_branches);
-        }
-    }
-}
-
-// ============================================================
-// CONEXÃO STRATUM (como NerdMiner_v2)
-// ============================================================
+// ============================================================================
+// CONEXÃO STRATUM — usando funções EXATAS do NerdMiner_v2
+// ============================================================================
 
 void connectToStratum() {
     poolStatus = "Conectando Pool...";
     isSubscribed = false;
     isAuthorized = false;
-    isConnected = false;
-    stratumMsgId = 4;  // 1=subscribe, 2=auth, 3=suggest, 4+=submit
+    hasJob = false;
+    client.stop();
     submitIdCount = 0;
     sharesSubmitted = 0;
-    current_job_id = "";
     currentPoolDifficulty = DEFAULT_DIFFICULTY;
     lastSuggestTime = 0;
     lastJobTime = 0;
     lastPoolDataTime = 0;
+    firstHeaderLog = true;
 
     if (!client.connect(STRATUM_HOST, STRATUM_PORT)) {
         poolStatus = "ERRO: Conexao";
@@ -564,68 +844,128 @@ void connectToStratum() {
         return;
     }
     Serial.printf("[STRATUM] Connected to %s:%d\n", STRATUM_HOST, STRATUM_PORT);
-    isConnected = true;
+    poolStatus = "Subscribing...";
     lastPoolDataTime = millis();
 
-    // 1) mining.subscribe (user agent compatível com NerdMiner_v2)
-    // pool.nerdminer.io aceita qualquer cliente Stratum
-    String sub = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"NerdMinerV2/V1.8.3\"]}\n";
-    client.print(sub);
-    Serial.printf("[STRATUM] >> mining.subscribe (user-agent: NerdMinerV2/V1.8.3)\n");
-
-    // Espera e le resposta do subscribe
-    delay(500);
-    while (client.available()) {
-        String line = client.readStringUntil('\n');
-        line.trim();
-        if (line.length() > 0) processStratum(line);
-    }
-
-    if (!isSubscribed) {
-        Serial.println("[STRATUM] Subscribe FAILED - no valid response");
+    // STEP 1: mining.subscribe (função EXATA do NerdMiner_v2)
+    mWorker = init_mining_subscribe();
+    if (!tx_mining_subscribe(client, mWorker)) {
+        Serial.println("[STRATUM] Subscribe FAILED");
         poolStatus = "ERRO: Subscribe";
         client.stop();
-        isConnected = false;
         return;
     }
+    isSubscribed = true;
 
-    // 2) mining.authorize (igual NerdMiner_v2)
-    String auth = "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" +
-                 String(WORKER_ID) + "\",\"" + String(WORKER_PASS) + "\"]}\n";
-    client.print(auth);
-    Serial.printf("[STRATUM] >> mining.authorize (%s)\n", WORKER_ID);
+    // STEP 2: mining.authorize (função EXATA do NerdMiner_v2)
+    strncpy(mWorker.wName, WORKER_ID, sizeof(mWorker.wName) - 1);
+    strncpy(mWorker.wPass, WORKER_PASS, sizeof(mWorker.wPass) - 1);
+    tx_mining_auth(client, mWorker.wName, mWorker.wPass);
 
-    delay(200);
+    // STEP 3: mining.suggest_difficulty (função EXATA do NerdMiner_v2)
+    tx_suggest_difficulty(client, DEFAULT_DIFFICULTY);
 
-    // 3) mining.suggest_difficulty (igual NerdMiner_v2 - usa id=3 fixo)
-    suggestDifficulty(DEFAULT_DIFFICULTY);
-    Serial.printf("[STRATUM] >> suggest_difficulty(%.10g)\n", DEFAULT_DIFFICULTY);
-
-    // 4) Le qualquer dado pendente (authorize response, set_difficulty, notify)
-    delay(200);
+    // Le respostas pendentes
+    delay(300);
     while (client.available()) {
         String line = client.readStringUntil('\n');
         line.trim();
-        if (line.length() > 0) processStratum(line);
+        if (line.length() < 2) continue;
+
+        stratum_method method = parse_mining_method(line);
+        if (method == STRATUM_SUCCESS) {
+            // authorize response
+            isAuthorized = true;
+            poolStatus = "Autorizado!";
+            Serial.println("[STRATUM] Authorized OK!");
+        }
+        else if (method == MINING_SET_DIFFICULTY) {
+            parse_mining_set_difficulty(line, currentPoolDifficulty);
+        }
+        else if (method == MINING_NOTIFY) {
+            if (parse_mining_notify(line, mJob)) {
+                hasJob = true;
+                lastJobTime = millis();
+            }
+        }
+        lastPoolDataTime = millis();
     }
 
     poolStatus = "Aguardando job...";
     beep(100);
 }
 
-// ============================================================
-// MINING LOOP
-// ============================================================
+// ============================================================================
+// MINING LOOP — usa mMiner.bytearray_blockheader EXATO do NerdMiner_v2
+// ============================================================================
 
 void miningLoop() {
-    // 1. Processa TODAS mensagens pendentes da pool
+    // 1. Processa mensagens pendentes da pool
     while (client.available()) {
         String line = client.readStringUntil('\n');
         line.trim();
-        if (line.length() > 0) processStratum(line);
+        if (line.length() < 2) continue;
+        lastPoolDataTime = millis();
+
+        stratum_method method = parse_mining_method(line);
+
+        if (method == STRATUM_SUCCESS) {
+            // Resposta a algum submit
+            unsigned long resp_id = parse_extract_id(line);
+            if (isRealSubmitId(resp_id)) {
+                Serial.print("[POOL RESP] id="); Serial.print(resp_id); Serial.print(" ");
+                serializeJson(g_doc, Serial); Serial.println();
+                if (g_doc["result"] == true) {
+                    acceptedShares++;
+                    Serial.println("[SHARE] *** ACCEPTED! ***");
+                    buzzerSuccess();
+                } else {
+                    rejectedShares++;
+                    Serial.print("[SHARE] REJECTED: ");
+                    if (g_doc.containsKey("error")) serializeJson(g_doc["error"], Serial);
+                    Serial.println();
+                }
+            }
+        }
+        else if (method == MINING_NOTIFY) {
+            if (parse_mining_notify(line, mJob)) {
+                hasJob = true;
+                lastJobTime = millis();
+                lastPoolDataTime = millis();
+
+                // RECALCULA mining data — função EXATA do NerdMiner_v2
+                Serial.println("[JOB] New mining.notify received, recalculating...");
+                mMiner = calculateMiningData(mWorker, mJob);
+                firstHeaderLog = true;
+
+                Serial.printf("[JOB] job=%s branches=%d nbits=%s ntime=%s\n",
+                    mJob.job_id.c_str(),
+                    mJob.merkle_branch.size(),
+                    mJob.nbits.c_str(),
+                    mJob.ntime.c_str());
+            } else {
+                Serial.println("[JOB] Parse error, reconnecting...");
+                client.stop();
+                isSubscribed = false;
+                isAuthorized = false;
+                hasJob = false;
+                delay(2000);
+                connectToStratum();
+                return;
+            }
+        }
+        else if (method == MINING_SET_DIFFICULTY) {
+            parse_mining_set_difficulty(line, currentPoolDifficulty);
+        }
+        else if (method == STRATUM_PARSE_ERROR) {
+            unsigned long resp_id = parse_extract_id(line);
+            if (isRealSubmitId(resp_id)) {
+                rejectedShares++;
+                Serial.printf("[POOL] Parse error for submit id=%lu\n", resp_id);
+            }
+        }
     }
 
-    // Recaptura tempo APÓS processar mensagens (processStratum atualiza lastPoolDataTime)
     unsigned long now = millis();
 
     // 2. Verifica conexão
@@ -633,149 +973,138 @@ void miningLoop() {
         Serial.println("[STRATUM] Connection lost! Reconnecting...");
         poolStatus = "Reconectando...";
         client.stop();
-        isConnected = false;
         isSubscribed = false;
         isAuthorized = false;
-        current_job_id = "";
+        hasJob = false;
         delay(3000);
         connectToStratum();
         return;
     }
 
-    // 3. Detecta inatividade do pool (sem dados por 2 minutos)
-    if (now - lastPoolDataTime > POOL_INACTIVITY_MS) {
+    // 3. Inatividade do pool
+    if (now - lastPoolDataTime > POOLINACTIVITY_TIME_ms) {
         Serial.println("[STRATUM] Pool inactivity timeout. Reconnecting...");
         poolStatus = "Timeout Pool...";
         client.stop();
-        isConnected = false;
         isSubscribed = false;
         isAuthorized = false;
-        current_job_id = "";
+        hasJob = false;
         delay(2000);
         connectToStratum();
         return;
     }
 
-    // 4. Keep-alive: envia suggest_difficulty a cada 30s se não enviamos nada
-    if (now - lastPoolDataTime > KEEPALIVE_MS) {
-        suggestDifficulty(currentPoolDifficulty);
-        Serial.println("[STRATUM] Keep-alive sent");
-        lastSuggestTime = now;
+    // 4. Keep-alive (igual NerdMiner_v2: suggest_difficulty)
+    if (now - lastPoolDataTime > KEEPALIVE_TIME_ms) {
+        Serial.println("  Sending  : KeepAlive suggest_difficulty");
+        tx_suggest_difficulty(client, currentPoolDifficulty);
+        lastPoolDataTime = now;
     }
 
-    // 5. Só minera se autorizado e tem job
-    if (!isAuthorized || current_job_id.length() == 0 || !isSubscribed) {
-        if (!isAuthorized && isSubscribed) {
-            poolStatus = "Aguardando auth...";
-        } else if (isAuthorized && current_job_id.length() == 0) {
-            poolStatus = "Aguardando job...";
-        }
+    // 5. Só minera se tem job
+    if (!hasJob || !isSubscribed) {
+        if (!hasJob && isSubscribed) poolStatus = "Aguardando job...";
+        else if (!isSubscribed) poolStatus = "Subscribing...";
         return;
     }
 
-    // 6. Prepara dados de mineração
-    String extranonce2 = formatExtranonce2(extranonce2_val, extranonce2_size);
-    uint8_t blockheader[80];
-    if (!buildBlockHeader(extranonce2, blockheader)) return;
-
-    // Debug: loga primeiro header para verificação
-    if (firstMiningLog) {
-        firstMiningLog = false;
-        Serial.print("[DEBUG] Header (hex): ");
+    // 6. MINERAÇÃO — usa mMiner.bytearray_blockheader gerado por calculateMiningData
+    //    que é a função EXATA do NerdMiner_v2
+    if (firstHeaderLog) {
+        firstHeaderLog = false;
+        Serial.print("[DEBUG] Full header (80 bytes): ");
         for (int i = 0; i < 80; i++) {
-            if (blockheader[i] < 0x10) Serial.print("0");
-            Serial.print(blockheader[i], HEX);
+            if (mMiner.bytearray_blockheader[i] < 0x10) Serial.print("0");
+            Serial.print(mMiner.bytearray_blockheader[i], HEX);
         }
         Serial.println();
     }
 
-    // 7. Minera por 50ms
     unsigned long loopStart = millis();
     uint32_t nonce = esp_random();
     unsigned int localH = 0;
 
     while (millis() - loopStart < 50) {
-        memcpy(&blockheader[76], &nonce, 4);
+        // Escreve nonce no header (offset 76, 4 bytes, little-endian nativo)
+        memcpy(&mMiner.bytearray_blockheader[76], &nonce, 4);
 
+        // Double SHA256 do header de 80 bytes
         uint8_t hashBe[32];
-        doubleSHA256(blockheader, 80, hashBe);
+        doubleSHA256(mMiner.bytearray_blockheader, 80, hashBe);
         localH++;
 
-        // CORREÇÃO v2.1: diff_from_target do NerdMiner_v2 recebe hash em BIG-ENDIAN!
-        // A função le256todouble() interpreta os bytes como LE internamente.
-        // NerdMiner_v2 chama diff_from_target(result->hash) onde hash está em BE.
-        // Antes (v2.0): invertíamos para LE → le256todouble lia ao contrário → diff falsa
-        double hashDiff = diffFromTarget(hashBe);
+        // Calcula dificuldade — EXATO do NerdMiner_v2:
+        // diff_from_target recebe hash em BIG-ENDIAN (ordem natural do SHA256)
+        double hashDiff = diff_from_target(hashBe);
+
         if (hashDiff > bestDiff) {
             bestDiff = hashDiff;
-            diagBestNonce = nonce;
-            diagBestEn2 = extranonce2;
-            diagBestDiff = hashDiff;
         }
 
-        // Conta shares locais (diff >= 0.00001) para mostrar atividade
+        // Conta shares locais para mostrar atividade
         if (hashDiff >= 0.00001) {
             localShares++;
-            if (localShares <= 5 || localShares % 20 == 0) {
-                Serial.printf("[LOCAL] diff=%.6f nonce=%08x (total:%lu best:%.6f)\n", hashDiff, nonce, localShares, bestDiff);
+            if (localShares <= 3 || localShares % 50 == 0) {
+                Serial.printf("[LOCAL] diff=%.6f nonce=%08x (total:%lu best:%.6f)\n",
+                    hashDiff, nonce, localShares, bestDiff);
             }
         }
 
         // Submete se atende dificuldade da pool
         if (hashDiff >= currentPoolDifficulty) {
-            Serial.printf("[FOUND] diff=%f nonce=%08x job=%s\n", hashDiff, nonce, current_job_id.c_str());
-            // Diagnóstico: dump header e hash completo
-            Serial.print("[FOUND] Header: ");
-            for (int i = 0; i < 80; i++) {
-                if (blockheader[i] < 0x10) Serial.print("0");
-                Serial.print(blockheader[i], HEX);
-            }
-            Serial.println();
+            Serial.printf("[FOUND] diff=%.6f nonce=%08x job=%s\n",
+                hashDiff, nonce, mJob.job_id.c_str());
+
+            // Dump hash para debug
             Serial.print("[FOUND] Hash BE: ");
             for (int i = 0; i < 32; i++) {
                 if (hashBe[i] < 0x10) Serial.print("0");
                 Serial.print(hashBe[i], HEX);
             }
             Serial.println();
-            submitShare(nonce, extranonce2);
+
+            // Submit usando função EXATA do NerdMiner_v2
+            unsigned long submit_id = 0;
+            tx_mining_submit(client, mWorker, mJob, nonce, submit_id);
+            trackSubmitId(submit_id);
+            sharesSubmitted++;
+            lastPoolDataTime = millis();
+
+            Serial.printf("[SHARE] Submitted id=%lu nonce=%08x en2=%s\n",
+                submit_id, nonce, mWorker.extranonce2.c_str());
         }
 
         nonce++;
-        if (nonce == 0) {
-            extranonce2_val++;
-            extranonce2 = formatExtranonce2(extranonce2_val, extranonce2_size);
-            if (!buildBlockHeader(extranonce2, blockheader)) return;
-        }
     }
 
     hashesTotal += localH;
     hashesInWindow += localH;
 
-    // 8. Hashrate (janela de 1 segundo)
+    // 7. Hashrate (janela de 1 segundo)
     unsigned long now2 = millis();
     if (now2 - lastHashTime >= 1000) {
         double elapsed = (double)(now2 - lastHashTime) / 1000.0;
         hashrate = (double)hashesInWindow / elapsed;
         hashesInWindow = 0;
         lastHashTime = now2;
-        // Log de hashrate a cada 5 segundos
         static unsigned long lastHRLog = 0;
         if (now2 - lastHRLog >= 5000) {
-            Serial.printf("[STATS] H/s=%.0f total=%luk local=%lu best=%.6f poolDiff=%.6f\n",
-                hashrate, hashesTotal/1000, localShares, bestDiff, currentPoolDifficulty);
+            Serial.printf("[STATS] H/s=%.0f total=%luk local=%lu best=%.6f poolDiff=%.6f Ok=%d Rj=%d\n",
+                hashrate, hashesTotal/1000, localShares, bestDiff, currentPoolDifficulty,
+                acceptedShares, rejectedShares);
             lastHRLog = now2;
         }
     }
 
-    // 9. Atualiza status da tela
+    // 8. Atualiza display
     if (hashrate > 100) {
         poolStatus = "Minerando " + String((unsigned long)hashrate) + " H/s";
     }
 }
 
-// ============================================================
+// ============================================================================
 // BOTÕES
-// ============================================================
+// ============================================================================
 
 void handleButtons() {
     if (currentState == STATE_SELECT_SSID) {
@@ -792,8 +1121,8 @@ void handleButtons() {
         if (digitalRead(BTN_UP) == LOW && digitalRead(BTN_DOWN) == LOW) {
             currentState = STATE_CONNECTING; drawUI();
             WiFi.begin(ssid.c_str(), password.c_str());
-            int attempts = 0;
-            while (WiFi.status() != WL_CONNECTED && attempts < 20) { delay(500); attempts++; }
+            int att = 0;
+            while (WiFi.status() != WL_CONNECTED && att < 20) { delay(500); att++; }
             if (WiFi.status() == WL_CONNECTED) {
                 preferences.begin("wifi", false);
                 preferences.putString("ssid", ssid);
@@ -814,13 +1143,13 @@ void handleButtons() {
     }
 }
 
-// ============================================================
+// ============================================================================
 // SETUP / LOOP
-// ============================================================
+// ============================================================================
 
 void setup() {
     Serial.begin(115200);
-    Serial.println("\n\n=== ESP32 BTC Miner v2.1 ===");
+    Serial.println("\n\n=== ESP32 BTC Miner v2.2 (Full NerdMiner_v2 Port) ===");
 
     pinMode(BTN_UP, INPUT_PULLUP); pinMode(BTN_DOWN, INPUT_PULLUP);
     pinMode(BTN_SEL, INPUT_PULLUP); pinMode(BTN_BACK, INPUT_PULLUP);
@@ -830,7 +1159,7 @@ void setup() {
     if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
         Serial.println("OLED not found!"); for (;;);
     }
-    drawSplashScreen();
+    drawSplash();
 
     preferences.begin("wifi", false);
     ssid = preferences.getString("ssid", "");
@@ -840,10 +1169,8 @@ void setup() {
     if (ssid.length() > 0) {
         Serial.printf("[WIFI] Connecting to: %s\n", ssid.c_str());
         WiFi.begin(ssid.c_str(), password.c_str());
-        int attempts = 0;
-        while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-            delay(500); attempts++;
-        }
+        int att = 0;
+        while (WiFi.status() != WL_CONNECTED && att < 20) { delay(500); att++; }
         if (WiFi.status() == WL_CONNECTED) {
             Serial.printf("[WIFI] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
             currentState = STATE_MINING;
@@ -871,7 +1198,6 @@ void loop() {
         miningLoop();
     }
     handleButtons();
-
-    static unsigned long lastScreenUpdate = 0;
-    if (millis() - lastScreenUpdate > 250) { drawUI(); lastScreenUpdate = millis(); }
+    static unsigned long lastScreen = 0;
+    if (millis() - lastScreen > 250) { drawUI(); lastScreen = millis(); }
 }
