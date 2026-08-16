@@ -22,17 +22,17 @@ Adafruit_SSD1306 display(128, 64, &Wire, -1);
 Preferences preferences;
 
 // --- POOL ---
-// public-pool.io IGNORA mining.suggest_difficulty e impõe diff 1.0
-// Impossível para ESP32 (~8KH/s) encontrar share diff 1.0 em tempo razoável
-// pool.nerdminers.org é o pool oficial NerdMiner - suporta diff baixa para ESP32
+// pool.nerdminers.org REJEITA clientes que não sejam NerdMiner original!
+// pool.nerdminer.io aceita QUALQUER cliente Stratum, ajusta diff auto para ESP32
+// Dashboard: https://nerdminer.io  |  0% taxa  |  Solo mining
 // Outras opções compatíveis (descomente para trocar):
-//   pool.nerdminer.io:3333  (CHMEX)
+//   pool.nerdminers.org:3333 (SÓ NerdMiner original!)
 //   pool.pyblock.xyz:3333   (curly60e)
 //   pool.sethforprivacy.com:3333
 //   pool.stompi.de:3333
 //   pool.solomining.de:3333
-//   public-pool.io:3333     (só funciona se aceitar diff baixa)
-const char* STRATUM_HOST = "pool.nerdminers.org";
+//   public-pool.io:3333     (bloqueia ESP32)
+const char* STRATUM_HOST = "pool.nerdminer.io";
 const int STRATUM_PORT = 3333;
 // Apenas o endereço BTC - igual ao NerdMiner_v2
 // O sufixo .esp32 impedia o painel de reconhecer o worker
@@ -270,8 +270,11 @@ bool buildBlockHeader(const String& extranonce2, uint8_t* headerOut) {
     }
     hexToBytes(headerHex, headerOut);
 
-    // Passo 3: Word-swap endian (IDÊNTICO ao NerdMiner_v2 utils.cpp)
-    // Helper: inverte bytes dentro de um bloco de 4 bytes
+    // Passo 3: Word-swap endian
+    // CORREÇÃO v2.0: prevhash do Stratum já é LE, NÃO precisa word-swap!
+    // version/ntime/nbits são enviados como hex do VALOR → word-swap para LE
+    // merkle root é SHA-256 output cru → não toca
+    // nonce é escrito via memcpy em LE nativo → não toca
     #define WORD_SWAP_4(off) do { \
         uint8_t t0 = headerOut[off], t1 = headerOut[off+1]; \
         headerOut[off] = headerOut[off+3]; \
@@ -280,20 +283,18 @@ bool buildBlockHeader(const String& extranonce2, uint8_t* headerOut) {
         headerOut[off+3] = t0; \
     } while(0)
 
-    // reverse version (offset 0, 4 bytes)
+    // version: valor hex → word-swap para LE (offset 0, 4 bytes)
     WORD_SWAP_4(0);
 
-    // reverse prev hash (offset 4, 32 bytes = 8 palavras de 4 bytes)
-    for (int w = 0; w < 8; w++) {
-        WORD_SWAP_4(4 + w * 4);
-    }
+    // prev hash: JÁ está em LE! NÃO fazer word-swap! (bug corrigido v2.0)
+    // O Stratum envia prevhash como LE hex, bytes vão direto pro header
 
-    // merkle root: NÃO INVERTE! (comentado no NerdMiner_v2)
+    // merkle root: NÃO INVERTE! SHA-256 output cru
 
-    // reverse ntime (offset 68, 4 bytes)
+    // ntime: valor hex → word-swap para LE (offset 68, 4 bytes)
     WORD_SWAP_4(68);
 
-    // reverse nbits (offset 72, 4 bytes)
+    // nbits: valor hex → word-swap para LE (offset 72, 4 bytes)
     WORD_SWAP_4(72);
 
     // nonce (offset 76): fica como "00000000", será preenchido no mining loop
@@ -348,7 +349,7 @@ void drawUI() {
         display.setCursor(0, 20); display.print("Conectando...");
     }
     else if (currentState == STATE_MINING) {
-        display.setCursor(0, 0); display.print("BTC MINER v1.8");
+            display.setCursor(0, 0); display.print("BTC MINER v2.0");
         display.drawLine(0, 10, 128, 10, WHITE);
         String statusShort = poolStatus.substring(0, 21);
         display.setCursor(0, 15); display.print(statusShort);
@@ -502,7 +503,7 @@ void processStratum(String line) {
         if (strcmp(method, "mining.set_difficulty") == 0) {
             double newDiff = g_doc["params"][0].as<double>();
             currentPoolDifficulty = newDiff;
-            Serial.printf("[STRATUM] Pool set diff: %.6f\n", newDiff);
+            Serial.printf("[STRATUM] *** Pool set diff: %.6f ***\n", newDiff);
         }
 
         if (strcmp(method, "mining.notify") == 0) {
@@ -563,11 +564,11 @@ void connectToStratum() {
     isConnected = true;
     lastPoolDataTime = millis();
 
-    // 1) mining.subscribe (user agent EXATO do NerdMiner_v2 V1.8.3)
-    // pool.nerdminers.org reconhece este user agent e aceita diff baixa
+    // 1) mining.subscribe (user agent compatível com NerdMiner_v2)
+    // pool.nerdminer.io aceita qualquer cliente Stratum
     String sub = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"NerdMinerV2/V1.8.3\"]}\n";
     client.print(sub);
-    Serial.println("[STRATUM] >> mining.subscribe");
+    Serial.printf("[STRATUM] >> mining.subscribe (user-agent: NerdMinerV2/V1.8.3)\n");
 
     // Espera e le resposta do subscribe
     delay(500);
@@ -721,6 +722,19 @@ void miningLoop() {
         // Submete se atende dificuldade da pool
         if (hashDiff >= currentPoolDifficulty) {
             Serial.printf("[FOUND] diff=%f nonce=%08x job=%s\n", hashDiff, nonce, current_job_id.c_str());
+            // Diagnóstico: dump header e hash completo
+            Serial.print("[FOUND] Header: ");
+            for (int i = 0; i < 80; i++) {
+                if (blockheader[i] < 0x10) Serial.print("0");
+                Serial.print(blockheader[i], HEX);
+            }
+            Serial.println();
+            Serial.print("[FOUND] Hash BE: ");
+            for (int i = 0; i < 32; i++) {
+                if (hashBe[i] < 0x10) Serial.print("0");
+                Serial.print(hashBe[i], HEX);
+            }
+            Serial.println();
             submitShare(nonce, extranonce2);
         }
 
@@ -804,7 +818,7 @@ void handleButtons() {
 
 void setup() {
     Serial.begin(115200);
-    Serial.println("\n\n=== ESP32 BTC Miner v1.8 ===");
+    Serial.println("\n\n=== ESP32 BTC Miner v2.0 ===");
 
     pinMode(BTN_UP, INPUT_PULLUP); pinMode(BTN_DOWN, INPUT_PULLUP);
     pinMode(BTN_SEL, INPUT_PULLUP); pinMode(BTN_BACK, INPUT_PULLUP);
