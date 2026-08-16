@@ -236,7 +236,7 @@ bool buildBlockHeader(const String& extranonce2, uint8_t* headerOut) {
     uint8_t coinbaseBytes[256];
     hexToBytes(coinbaseHex, coinbaseBytes);
 
-    // Calcula merkle root
+    // Calcula merkle root (igual NerdMiner_v2: double SHA256)
     uint8_t merkleRoot[32];
     doubleSHA256(coinbaseBytes, cbLen, merkleRoot);
 
@@ -250,22 +250,55 @@ bool buildBlockHeader(const String& extranonce2, uint8_t* headerOut) {
         doubleSHA256(buf, 64, merkleRoot);
     }
 
-    // Preenche header (tudo little-endian)
-    // Version
-    hexToBytes(reverseHex(current_version_hex), &headerOut[0]);
-    // Previous hash
-    hexToBytes(reverseHex(current_prevhash), &headerOut[4]);
-    // Merkle root (BE → inverter para LE)
-    uint8_t merkleLe[32];
-    memcpy(merkleLe, merkleRoot, 32);
-    reverseBytes(merkleLe, 32);
-    memcpy(&headerOut[36], merkleLe, 32);
-    // ntime
-    hexToBytes(reverseHex(current_ntime_hex), &headerOut[68]);
-    // nbits
-    hexToBytes(reverseHex(current_nbits_hex), &headerOut[72]);
-    // nonce (preenchido depois no mining loop)
-    memset(&headerOut[76], 0, 4);
+    // === CONSTRUIR HEADER IDÊNTICO AO NerdMiner_v2 ===
+    // Passo 1: Monta string hex do header (tudo em ordem BE/original)
+    // merkle_root fica em BE (ordem natural do SHA256) - NÃO inverte!
+    String merkleHex = "";
+    for (int i = 0; i < 32; i++) {
+        if (merkleRoot[i] < 0x10) merkleHex += "0";
+        merkleHex += String(merkleRoot[i], HEX);
+    }
+    // Ordem: version + prevhash + merkle + ntime + nbits + nonce(00000000)
+    String headerHex = current_version_hex + current_prevhash + merkleHex +
+                       current_ntime_hex + current_nbits_hex + "00000000";
+
+    // Passo 2: Converte hex para bytes
+    int headerLen = headerHex.length() / 2;
+    if (headerLen != 80) {
+        Serial.printf("[ERROR] Header len=%d (deveria ser 80)\n", headerLen);
+        return false;
+    }
+    hexToBytes(headerHex, headerOut);
+
+    // Passo 3: Word-swap endian (IDÊNTICO ao NerdMiner_v2 utils.cpp)
+    // Helper: inverte bytes dentro de um bloco de 4 bytes
+    #define WORD_SWAP_4(off) do { \
+        uint8_t t0 = headerOut[off], t1 = headerOut[off+1]; \
+        headerOut[off] = headerOut[off+3]; \
+        headerOut[off+1] = headerOut[off+2]; \
+        headerOut[off+2] = t1; \
+        headerOut[off+3] = t0; \
+    } while(0)
+
+    // reverse version (offset 0, 4 bytes)
+    WORD_SWAP_4(0);
+
+    // reverse prev hash (offset 4, 32 bytes = 8 palavras de 4 bytes)
+    for (int w = 0; w < 8; w++) {
+        WORD_SWAP_4(4 + w * 4);
+    }
+
+    // merkle root: NÃO INVERTE! (comentado no NerdMiner_v2)
+
+    // reverse ntime (offset 68, 4 bytes)
+    WORD_SWAP_4(68);
+
+    // reverse nbits (offset 72, 4 bytes)
+    WORD_SWAP_4(72);
+
+    // nonce (offset 76): fica como "00000000", será preenchido no mining loop
+
+    #undef WORD_SWAP_4
     return true;
 }
 
@@ -315,7 +348,7 @@ void drawUI() {
         display.setCursor(0, 20); display.print("Conectando...");
     }
     else if (currentState == STATE_MINING) {
-        display.setCursor(0, 0); display.print("BTC MINER v1.7");
+        display.setCursor(0, 0); display.print("BTC MINER v1.8");
         display.drawLine(0, 10, 128, 10, WHITE);
         String statusShort = poolStatus.substring(0, 21);
         display.setCursor(0, 15); display.print(statusShort);
@@ -718,19 +751,7 @@ void miningLoop() {
         }
     }
 
-    // 9. Submit diagnóstico: a cada 90s envia melhor share para ver resposta do pool
-    unsigned long now3 = millis();
-    if (now3 - lastDiagTime > 90000 && diagBestNonce != 0 && isAuthorized && current_job_id.length() > 0) {
-        lastDiagTime = now3;
-        Serial.printf("\n[DIAG] === SUBMIT DIAGNÓSTICO #%d ===\n", diagSubmitCount + 1);
-        Serial.printf("[DIAG] Enviando melhor share: diff=%.6f (pool exige %.6f)\n",
-            diagBestDiff, currentPoolDifficulty);
-        Serial.printf("[DIAG] Se o pool aceitar, nosso formato está CORRETO e só precisa de sorte\n");
-        Serial.printf("[DIAG] Se rejeitar com 'stale'/'invalid', temos bug no formato\n\n");
-        submitShare(diagBestNonce, diagBestEn2, true);
-    }
-
-    // 10. Atualiza status da tela
+    // 9. Atualiza status da tela
     if (hashrate > 100) {
         poolStatus = "Minerando " + String((unsigned long)hashrate) + " H/s";
     }
@@ -783,7 +804,7 @@ void handleButtons() {
 
 void setup() {
     Serial.begin(115200);
-    Serial.println("\n\n=== ESP32 BTC Miner v1.7 ===");
+    Serial.println("\n\n=== ESP32 BTC Miner v1.8 ===");
 
     pinMode(BTN_UP, INPUT_PULLUP); pinMode(BTN_DOWN, INPUT_PULLUP);
     pinMode(BTN_SEL, INPUT_PULLUP); pinMode(BTN_BACK, INPUT_PULLUP);
