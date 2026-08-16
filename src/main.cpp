@@ -496,7 +496,8 @@ volatile bool miningActive = false;
 mining_subscribe mWorker;
 mining_job mJob;
 miner_data mMiner;
-double currentPoolDifficulty = DEFAULT_DIFFICULTY;
+double currentPoolDifficulty = DEFAULT_DIFFICULTY;  // O que a pool manda (display only)
+double submitDifficulty = DEFAULT_DIFFICULTY;       // O que usamos para submissão
 bool isSubscribed = false;
 bool isAuthorized = false;
 bool hasJob = false;
@@ -621,6 +622,7 @@ void connectToStratum() {
     submitIdCount = 0;
     sharesSubmitted = 0;
     currentPoolDifficulty = DEFAULT_DIFFICULTY;
+    submitDifficulty = DEFAULT_DIFFICULTY;
     lastJobTime = 0;
     lastPoolDataTime = 0;
     firstHeaderLog = true;
@@ -659,7 +661,12 @@ void connectToStratum() {
             poolStatus = "Autorizado!";
             Serial.println("[STRATUM] Authorized OK!");
         } else if (method == MINING_SET_DIFFICULTY) {
-            parse_mining_set_difficulty(line, currentPoolDifficulty);
+            double poolDiff = 0;
+            if (parse_mining_set_difficulty(line, poolDiff)) {
+                currentPoolDifficulty = poolDiff;
+                Serial.printf("[DIFF] Pool mandou diff=%.6f — IGNORANDO, usando submitDiff=%.6f\n",
+                    poolDiff, submitDifficulty);
+            }
         } else if (method == MINING_NOTIFY) {
             if (parse_mining_notify(line, mJob)) {
                 hasJob = true;
@@ -726,7 +733,12 @@ void miningLoop() {
             }
         }
         else if (method == MINING_SET_DIFFICULTY) {
-            parse_mining_set_difficulty(line, currentPoolDifficulty);
+            double poolDiff = 0;
+            if (parse_mining_set_difficulty(line, poolDiff)) {
+                currentPoolDifficulty = poolDiff;
+                Serial.printf("[DIFF] Pool mandou diff=%.6f — IGNORANDO, usando submitDiff=%.6f\n",
+                    poolDiff, submitDifficulty);
+            }
         }
     }
 
@@ -754,7 +766,7 @@ void miningLoop() {
 
     if (now - lastPoolDataTime > KEEPALIVE_TIME_ms) {
         Serial.println("  Sending  : KeepAlive");
-        tx_suggest_difficulty(client, currentPoolDifficulty);
+        tx_suggest_difficulty(client, submitDifficulty);
         lastPoolDataTime = now;
     }
 
@@ -797,7 +809,7 @@ void miningLoop() {
             }
         }
 
-        if (hashDiff >= currentPoolDifficulty) {
+        if (hashDiff >= submitDifficulty) {
             Serial.printf("[FOUND] diff=%.6f nonce=%08x job=%s\n",
                 hashDiff, nonce, mJob.job_id.c_str());
             Serial.print("[FOUND] Hash BE: ");
@@ -831,9 +843,9 @@ void miningLoop() {
         lastHashTime = now2;
         static unsigned long lastHRLog = 0;
         if (now2 - lastHRLog >= 5000) {
-            Serial.printf("[STATS] H/s=%.0f total=%luk local=%lu best=%.6f pD=%.6f Ok=%d Rj=%d\n",
+            Serial.printf("[STATS] H/s=%.0f total=%luk local=%lu best=%.6f sD=%.6f pD=%.6f Ok=%d Rj=%d\n",
                 hashrate, hashesTotal / 1000, localShares, bestDiff,
-                currentPoolDifficulty, acceptedShares, rejectedShares);
+                submitDifficulty, currentPoolDifficulty, acceptedShares, rejectedShares);
             lastHRLog = now2;
         }
     }
