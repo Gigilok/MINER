@@ -1,12 +1,11 @@
 // ============================================================================
-// ESP32 BTC Miner v2.5 — FIX CRÍTICO: Submeter na nossa dificuldade
+// ESP32 BTC Miner v2.6 — POOL CORRETA + Submeter na nossa dificuldade
 // ============================================================================
-// PROBLEMA v2.4: A pool ignora suggest_difficulty e força diff=1.0. Com 5kH/s,
-//   levaria ~10 DIAS para encontrar um share diff 1.0. Resultado: Ok=0 Rj=0
-//   porque NENHUM share era enviado.
-// FIX v2.5: Adiciona submitDifficulty (0.00015) que NUNCA muda. A pool pode
-//   mandar set_difficulty 1.0 para display, mas nos submetemos na nossa.
-//   O pior caso é a pool rejeitar, mas pelo menos tentamos.
+// PROBLEMA: pool.nerdminer.io ignora suggest_difficulty e força diff=1.0.
+//   Com 5kH/s, levaria ~10 DIAS para encontrar um share diff 1.0.
+// SOLUÇÃO v2.6: Mudou para public-pool.io (pool PADRÃO do NerdMiner_v2).
+//   Esta pool NÃO envia set_difficulty — aceita shares de qualquer dificuldade.
+// FIX v2.5 mantido: submitDifficulty (0.00015) separado do pool diff.
 // ============================================================================
 
 #include <Arduino.h>
@@ -34,8 +33,8 @@
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 Preferences preferences;
 
-// --- POOL ---
-const char* STRATUM_HOST = "pool.nerdminer.io";
+// --- POOL (public-pool.io = padrao do NerdMiner_v2, aceita shares de baixa diff) ---
+const char* STRATUM_HOST = "public-pool.io";
 const int STRATUM_PORT = 3333;
 const char* WORKER_ID = "1FRpCfmiwAGVkCLt2FjVuuoAjhSaE2j4QN";
 const char* WORKER_PASS = "x";
@@ -156,6 +155,7 @@ double diff_from_target(void *target) {
 // FIX v2.3: Todas as variáveis grandes são STATIC para não usar stack
 // ============================================================================
 
+// Variáveis static para não consumir stack da task
 static char s_target_buf[TARGET_BUFFER_SIZE + 1];
 static char s_coinbase_buf[512];
 static uint8_t s_bytearray[256];
@@ -171,6 +171,7 @@ miner_data calculateMiningData(mining_subscribe& mWorker, mining_job mJob) {
   miner_data mMiner;
   memset(&mMiner, 0, sizeof(mMiner));
 
+  // calculate target
   memset(s_target_buf, '0', TARGET_BUFFER_SIZE);
   int zeros = (int) strtol(mJob.nbits.substring(0, 2).c_str(), 0, 16) - 3;
   memcpy(s_target_buf + zeros - 2, mJob.nbits.substring(2).c_str(), mJob.nbits.length() - 2);
@@ -179,12 +180,14 @@ miner_data calculateMiningData(mining_subscribe& mWorker, mining_job mJob) {
 
   size_t size_target = to_byte_array(s_target_buf, 32, mMiner.bytearray_target);
 
+  // Reverse first 8 bytes of target (XOR swap)
   for (size_t j = 0; j < 8; j++) {
     mMiner.bytearray_target[j] ^= mMiner.bytearray_target[size_target - 1 - j];
     mMiner.bytearray_target[size_target - 1 - j] ^= mMiner.bytearray_target[j];
     mMiner.bytearray_target[j] ^= mMiner.bytearray_target[size_target - 1 - j];
   }
 
+  // get extranonce2
   if (mWorker.extranonce2_size == 2)
       mWorker.extranonce2 = "0001";
   else if (mWorker.extranonce2_size == 4)
@@ -196,6 +199,7 @@ miner_data calculateMiningData(mining_subscribe& mWorker, mining_job mJob) {
       mWorker.extranonce2 = "00000001";
   }
 
+  // get coinbase — usa buffer static
   snprintf(s_coinbase_buf, sizeof(s_coinbase_buf), "%s%s%s%s",
            mJob.coinb1.c_str(), mWorker.extranonce1.c_str(),
            mWorker.extranonce2.c_str(), mJob.coinb2.c_str());
@@ -203,6 +207,7 @@ miner_data calculateMiningData(mining_subscribe& mWorker, mining_job mJob) {
   size_t str_len = strlen(s_coinbase_buf) / 2;
   size_t res = to_byte_array(s_coinbase_buf, str_len * 2, s_bytearray);
 
+  // Double SHA256 do coinbase
   mbedtls_sha256_init(&s_ctx);
   mbedtls_sha256_starts_ret(&s_ctx, 0);
   mbedtls_sha256_update_ret(&s_ctx, s_bytearray, str_len);
@@ -214,6 +219,7 @@ miner_data calculateMiningData(mining_subscribe& mWorker, mining_job mJob) {
 
   memcpy(mMiner.merkle_result, s_shaResult, 32);
 
+  // Merkle tree
   for (size_t k = 0; k < mJob.merkle_branch.size(); k++) {
       const char* merkle_element = (const char*) mJob.merkle_branch[k];
       size_t res_m = to_byte_array(merkle_element, 64, s_bytearray_m);
@@ -231,6 +237,7 @@ miner_data calculateMiningData(mining_subscribe& mWorker, mining_job mJob) {
       mbedtls_sha256_free(&s_ctx2);
   }
 
+  // merkle root
   Serial.print("    merkle sha         : ");
   for (int i = 0; i < 32; i++) {
     Serial.printf("%02x", mMiner.merkle_result[i]);
@@ -239,13 +246,16 @@ miner_data calculateMiningData(mining_subscribe& mWorker, mining_job mJob) {
   s_merkle_root[64] = 0;
   Serial.println("");
 
+  // calculate blockheader
   String blockheader = mJob.version + mJob.prev_block_hash + String(s_merkle_root) + mJob.ntime + mJob.nbits + "00000000";
   str_len = blockheader.length() / 2;
   res = to_byte_array(blockheader.c_str(), str_len * 2, mMiner.bytearray_blockheader);
 
+  // === ENDIAN SWAPS — EXATOS do NerdMiner_v2 ===
   uint8_t buff;
   size_t bword, bsize, boffset;
 
+  // reverse version (4 bytes)
   boffset = 0; bsize = 4;
   for (size_t j = boffset; j < boffset + (bsize / 2); j++) {
       buff = mMiner.bytearray_blockheader[j];
@@ -253,6 +263,7 @@ miner_data calculateMiningData(mining_subscribe& mWorker, mining_job mJob) {
       mMiner.bytearray_blockheader[2 * boffset + bsize - 1 - j] = buff;
   }
 
+  // reverse prev hash (8 words de 4 bytes)
   boffset = 4; bword = 4; bsize = 32;
   for (size_t i = 1; i <= bsize / bword; i++) {
       for (size_t j = boffset; j < boffset + bword / 2; j++) {
@@ -263,6 +274,9 @@ miner_data calculateMiningData(mining_subscribe& mWorker, mining_job mJob) {
       boffset += bword;
   }
 
+  // merkle root: NAO INVERTE!
+
+  // reverse ntime (4 bytes)
   boffset = 68; bsize = 4;
   for (size_t j = boffset; j < boffset + (bsize / 2); j++) {
       buff = mMiner.bytearray_blockheader[j];
@@ -270,6 +284,7 @@ miner_data calculateMiningData(mining_subscribe& mWorker, mining_job mJob) {
       mMiner.bytearray_blockheader[2 * boffset + bsize - 1 - j] = buff;
   }
 
+  // reverse nbits (4 bytes)
   boffset = 72; bsize = 4;
   for (size_t j = boffset; j < boffset + (bsize / 2); j++) {
       buff = mMiner.bytearray_blockheader[j];
@@ -287,11 +302,13 @@ miner_data calculateMiningData(mining_subscribe& mWorker, mining_job mJob) {
 
 // ============================================================================
 // STRATUM — funcoes EXATAS do NerdMiner_v2
+// FIX v2.3: g_doc e GLOBAL (6144 bytes), payload buffers sao STATIC
 // ============================================================================
 
 StaticJsonDocument<BUFFER_JSON_DOC> g_doc;
 unsigned long g_stratum_id = 1;
 
+// Buffers static para evitar stack
 static char s_payload[512];
 
 unsigned long getNextId(unsigned long id) {
@@ -454,7 +471,7 @@ void doubleSHA256(const uint8_t* data, size_t len, uint8_t* out) {
 }
 
 // ============================================================================
-// VARIAVEIS GLOBAIS
+// VARIAVEIS GLOBAIS (acessadas por UI e mining task)
 // ============================================================================
 
 String ssid = "";
@@ -478,11 +495,12 @@ enum UI_State { STATE_SCANNING, STATE_SELECT_SSID, STATE_INPUT_PASSWORD, STATE_C
 UI_State currentState = STATE_SCANNING;
 volatile bool miningActive = false;
 
+// Mining state
 mining_subscribe mWorker;
 mining_job mJob;
 miner_data mMiner;
-double currentPoolDifficulty = DEFAULT_DIFFICULTY;
-double submitDifficulty = DEFAULT_DIFFICULTY;
+double currentPoolDifficulty = DEFAULT_DIFFICULTY;  // Atualizado pelo pool (DISPLAY only)
+double submitDifficulty = DEFAULT_DIFFICULTY;          // NOSSO threshold - NUNCA muda!
 bool isSubscribed = false;
 bool isAuthorized = false;
 bool hasJob = false;
@@ -490,6 +508,7 @@ unsigned long lastPoolDataTime = 0;
 unsigned long lastJobTime = 0;
 bool firstHeaderLog = true;
 
+// Submit tracking
 #define MAX_SUBMIT_IDS 32
 unsigned long submitIdList[MAX_SUBMIT_IDS];
 int submitIdCount = 0;
@@ -569,7 +588,7 @@ void drawUI() {
         display.setCursor(0, 20); display.print("Conectando...");
     }
     else if (state == STATE_MINING) {
-        display.setCursor(0, 0); display.print("BTC MINER v2.5");
+        display.setCursor(0, 0); display.print("BTC MINER v2.6");
         display.drawLine(0, 10, 128, 10, WHITE);
         display.setCursor(0, 15); display.print(poolStatus.substring(0, 21));
         display.setCursor(0, 25); display.print("H/s:");
@@ -669,6 +688,7 @@ void connectToStratum() {
 // ============================================================================
 
 void miningLoop() {
+    // 1. Processa mensagens pendentes
     while (client.available()) {
         String line = client.readStringUntil('\n');
         if (line.length() < 2) continue;
@@ -679,6 +699,7 @@ void miningLoop() {
         if (method == STRATUM_SUCCESS) {
             unsigned long resp_id = parse_extract_id(line);
             if (isRealSubmitId(resp_id)) {
+                // Re-parse para ver resultado
                 deserializeJson(g_doc, line);
                 Serial.print("[POOL RESP] id="); Serial.print(resp_id); Serial.print(" ");
                 serializeJson(g_doc, Serial); Serial.println();
@@ -757,6 +778,7 @@ void miningLoop() {
         return;
     }
 
+    // MINERACAO
     if (firstHeaderLog) {
         firstHeaderLog = false;
         Serial.print("[DEBUG] Header (80b): ");
@@ -790,6 +812,8 @@ void miningLoop() {
             }
         }
 
+        // FIX v2.5: Usa submitDifficulty (NOSSO) ao inves de currentPoolDifficulty (POOL)
+        // A pool manda diff=1.0 mas nosso ESP32 a 5kH/s nunca alcancaria isso
         if (hashDiff > submitDifficulty) {
             Serial.printf("[FOUND] diff=%.6f nonce=%08x job=%s sD=%.6f\n",
                 hashDiff, nonce, mJob.job_id.c_str(), submitDifficulty);
@@ -812,6 +836,7 @@ void miningLoop() {
 
     hashesTotal += localH;
 
+    // Hashrate
     static unsigned long lastHashTime = 0;
     static unsigned long hashesInWindow = 0;
     hashesInWindow += localH;
@@ -836,7 +861,7 @@ void miningLoop() {
 }
 
 // ============================================================================
-// MINING TASK (FreeRTOS) — 16KB stack
+// MINING TASK (FreeRTOS) — 16KB stack para evitar stack overflow
 // ============================================================================
 
 void miningTaskFunc(void *param) {
@@ -845,7 +870,7 @@ void miningTaskFunc(void *param) {
         if ((UI_State)currentState == STATE_MINING && miningActive) {
             miningLoop();
         }
-        vTaskDelay(1);
+        vTaskDelay(1);  // yield 1ms
     }
 }
 
@@ -897,7 +922,7 @@ void handleButtons() {
 
 void setup() {
     Serial.begin(115200);
-    Serial.println("\n\n=== ESP32 BTC Miner v2.5 (submete na nossa diff) ===");
+    Serial.println("\n\n=== ESP32 BTC Miner v2.6 (public-pool.io) ===");
 
     pinMode(BTN_UP, INPUT_PULLUP); pinMode(BTN_DOWN, INPUT_PULLUP);
     pinMode(BTN_SEL, INPUT_PULLUP); pinMode(BTN_BACK, INPUT_PULLUP);
@@ -931,14 +956,15 @@ void setup() {
         currentState = STATE_SCANNING;
     }
 
+    // Cria mining task com 16KB de stack (4x mais que o default do loopTask)
     xTaskCreateUniversal(
-        miningTaskFunc,
-        "miningTask",
-        16384,
-        NULL,
-        1,
-        NULL,
-        1
+        miningTaskFunc,    // funcao
+        "miningTask",      // nome
+        16384,             // stack size em bytes (16KB)
+        NULL,              // parametro
+        1,                 // prioridade
+        NULL,              // handle
+        1                  // core (core 1 = app core)
     );
 
     beep(100);
