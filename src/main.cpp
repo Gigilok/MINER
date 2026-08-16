@@ -44,7 +44,7 @@ const char* WORKER_PASS = "x";
 #define MAX_MERKLE_BRANCHES 32
 #define BUFFER_JSON_DOC 6144
 #define BUFFER 512
-#define DEFAULT_DIFFICULTY  0.00015
+#define DEFAULT_DIFFICULTY  0.000001
 #define KEEPALIVE_TIME_ms       30000
 #define POOLINACTIVITY_TIME_ms  60000
 #define CURRENT_VERSION "V1.8.3"
@@ -623,6 +623,8 @@ void connectToStratum() {
     sharesSubmitted = 0;
     currentPoolDifficulty = DEFAULT_DIFFICULTY;
     submitDifficulty = DEFAULT_DIFFICULTY;
+    bestDiff = 0.0;
+    localShares = 0;
     lastJobTime = 0;
     lastPoolDataTime = 0;
     firstHeaderLog = true;
@@ -801,7 +803,7 @@ void miningLoop() {
 
         if (hashDiff > bestDiff) bestDiff = hashDiff;
 
-        if (hashDiff >= 0.00001) {
+        if (hashDiff >= 0.000005) {
             localShares++;
             if (localShares <= 3 || localShares % 50 == 0) {
                 Serial.printf("[LOCAL] diff=%.6f nonce=%08x (best:%.6f)\n",
