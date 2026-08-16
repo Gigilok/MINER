@@ -95,6 +95,13 @@ unsigned long submitIdList[MAX_SUBMIT_IDS];
 int submitIdCount = 0;
 unsigned long sharesSubmitted = 0;  // Total de shares enviados (não confundir com Ok/Rj)
 
+// Diagnóstico: rastreia melhor share para submit forçado
+uint32_t diagBestNonce = 0;
+String diagBestEn2 = "";
+double diagBestDiff = 0.0;
+unsigned long lastDiagTime = 0;
+int diagSubmitCount = 0;
+
 void trackSubmitId(unsigned long id) {
     submitIdList[submitIdCount % MAX_SUBMIT_IDS] = id;
     submitIdCount++;
@@ -308,7 +315,7 @@ void drawUI() {
         display.setCursor(0, 20); display.print("Conectando...");
     }
     else if (currentState == STATE_MINING) {
-        display.setCursor(0, 0); display.print("BTC MINER v1.6");
+        display.setCursor(0, 0); display.print("BTC MINER v1.7");
         display.drawLine(0, 10, 128, 10, WHITE);
         String statusShort = poolStatus.substring(0, 21);
         display.setCursor(0, 15); display.print(statusShort);
@@ -349,12 +356,13 @@ void drawUI() {
 // STRATUM PROTOCOL
 // ============================================================
 
-void submitShare(uint32_t nonce, const String& extranonce2) {
+void submitShare(uint32_t nonce, const String& extranonce2, bool isDiag = false) {
     // Formata nonce como hex (igual ao NerdMiner_v2: SEM padding)
     String nonceHex = String(nonce, HEX);
     unsigned long thisId = stratumMsgId++;
     trackSubmitId(thisId);  // Registra como submit REAL
     sharesSubmitted++;
+    if (isDiag) diagSubmitCount++;
 
     String payload = "{\"id\":" + String(thisId) +
         ",\"method\":\"mining.submit\",\"params\":[\"" +
@@ -365,8 +373,15 @@ void submitShare(uint32_t nonce, const String& extranonce2) {
         nonceHex + "\"]}\n";
     client.print(payload);
     lastPoolDataTime = millis();
-    Serial.printf("[SHARE] Submitted id=%lu nonce=%08x job=%s en2=%s\n",
-        thisId, nonce, current_job_id.c_str(), extranonce2.c_str());
+    if (isDiag) {
+        Serial.printf("[DIAG] #%d id=%lu diff=%.6f nonce=%08x job=%s en2=%s\n",
+            diagSubmitCount, thisId, diagBestDiff, nonce,
+            current_job_id.c_str(), extranonce2.c_str());
+        Serial.printf("[DIAG] JSON enviado: %s", payload.c_str());
+    } else {
+        Serial.printf("[SHARE] Submitted id=%lu nonce=%08x job=%s en2=%s\n",
+            thisId, nonce, current_job_id.c_str(), extranonce2.c_str());
+    }
 }
 
 void suggestDifficulty(double diff) {
@@ -427,9 +442,13 @@ void processStratum(String line) {
         else if (id >= 4) {
             // CRÍTICO: só processar se este ID foi usado num submit real
             if (!isRealSubmitId(id)) {
-                // Não é um submit real (não deve acontecer com novo código)
                 return;
             }
+            // Loga a RESPOSTA COMPLETA do pool para diagnóstico
+            Serial.print("[POOL RESP] id="); Serial.print(id); Serial.print(" ");
+            serializeJson(g_doc, Serial);
+            Serial.println();
+
             if (g_doc["result"] == true) {
                 acceptedShares++;
                 Serial.println("[SHARE] *** ACCEPTED! ***");
@@ -651,7 +670,12 @@ void miningLoop() {
         reverseBytes(hashLe, 32);
 
         double hashDiff = diffFromTarget(hashLe);
-        if (hashDiff > bestDiff) bestDiff = hashDiff;
+        if (hashDiff > bestDiff) {
+            bestDiff = hashDiff;
+            diagBestNonce = nonce;
+            diagBestEn2 = extranonce2;
+            diagBestDiff = hashDiff;
+        }
 
         // Conta shares locais (diff >= 0.00001) para mostrar atividade
         if (hashDiff >= 0.00001) {
@@ -694,7 +718,19 @@ void miningLoop() {
         }
     }
 
-    // 9. Atualiza status da tela
+    // 9. Submit diagnóstico: a cada 90s envia melhor share para ver resposta do pool
+    unsigned long now3 = millis();
+    if (now3 - lastDiagTime > 90000 && diagBestNonce != 0 && isAuthorized && current_job_id.length() > 0) {
+        lastDiagTime = now3;
+        Serial.printf("\n[DIAG] === SUBMIT DIAGNÓSTICO #%d ===\n", diagSubmitCount + 1);
+        Serial.printf("[DIAG] Enviando melhor share: diff=%.6f (pool exige %.6f)\n",
+            diagBestDiff, currentPoolDifficulty);
+        Serial.printf("[DIAG] Se o pool aceitar, nosso formato está CORRETO e só precisa de sorte\n");
+        Serial.printf("[DIAG] Se rejeitar com 'stale'/'invalid', temos bug no formato\n\n");
+        submitShare(diagBestNonce, diagBestEn2, true);
+    }
+
+    // 10. Atualiza status da tela
     if (hashrate > 100) {
         poolStatus = "Minerando " + String((unsigned long)hashrate) + " H/s";
     }
@@ -747,7 +783,7 @@ void handleButtons() {
 
 void setup() {
     Serial.begin(115200);
-    Serial.println("\n\n=== ESP32 BTC Miner v1.6 ===");
+    Serial.println("\n\n=== ESP32 BTC Miner v1.7 ===");
 
     pinMode(BTN_UP, INPUT_PULLUP); pinMode(BTN_DOWN, INPUT_PULLUP);
     pinMode(BTN_SEL, INPUT_PULLUP); pinMode(BTN_BACK, INPUT_PULLUP);
